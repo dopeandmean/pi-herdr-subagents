@@ -56,6 +56,19 @@ import {
   loadStatusConfig,
 } from "./status.ts";
 import {
+  allocateWorktree,
+  captureHandoff,
+  inspectLane,
+  listLanes,
+  manifestFileFor,
+  readManifest,
+  recordLaneEvidence,
+  removeLane,
+  type HandoffManifest,
+  type LaneInspection,
+  type WorktreeAllocation,
+} from "./worktree.ts";
+import {
   getSubagentActivityFile,
   readSubagentActivityFile,
   type ActivityReadResult,
@@ -112,6 +125,7 @@ function buildSubagentRoutingGuidelines(
     "For a bare spawn, omit model and thinking to inherit the parent runtime.",
     "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
     "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Do not invent aliases or fuzzy names.",
+    "When parallel children may edit overlapping files, spawn them with worktree: true so each writer gets its own Git worktree and branch instead of sharing one checkout. Isolated lanes are rejected up front unless the checkout is clean, and each returns a captured patch plus manifest for review before merge.",
     agentCatalog ?? "Available named subagent catalog becomes available after session start.",
     modelCatalog ?? "Authenticated subagent model catalog becomes available after session start.",
   ];
@@ -162,6 +176,18 @@ const SubagentParams = Type.Object({
     Type.Boolean({
       description:
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+    }),
+  ),
+  worktree: Type.Optional(
+    Type.Boolean({
+      description:
+        "Run this child in its own Git worktree on a new branch, so parallel writers cannot touch each other or the source checkout. Requires a clean Git checkout; the spawn is rejected (nothing launched, nothing modified) otherwise. Changes are captured as a patch + manifest when the child exits.",
+    }),
+  ),
+  baseRef: Type.Optional(
+    Type.String({
+      description:
+        "Git ref the isolated worktree branches from (only with worktree: true). Defaults to HEAD.",
     }),
   ),
   interactive: Type.Optional(
@@ -562,6 +588,45 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /** Isolated worktree lane evidence, when the spawn used `worktree: true`. */
+  worktreeLane?: WorktreeLaneOutcome;
+}
+
+interface WorktreeLaneOutcome {
+  laneId: string;
+  branch: string;
+  worktree: string;
+  manifestFile: string;
+  patchFile?: string;
+  changedPaths: number;
+  childCommits: number;
+  captureError?: string;
+  cleanup: "removed" | "preserved" | "pending";
+  cleanupReason?: string;
+}
+
+/**
+ * One-line-per-fact summary of a lane, steered to the parent on completion.
+ */
+function formatWorktreeLane(outcome: WorktreeLaneOutcome): string {
+  const changed = `${outcome.changedPaths} changed path${outcome.changedPaths === 1 ? "" : "s"}` +
+    (outcome.childCommits > 0 ? `, ${outcome.childCommits} child commit(s)` : "");
+  const lines = [`Worktree lane ${outcome.branch} at ${outcome.worktree}`, `Changes: ${changed}`];
+  if (outcome.patchFile) lines.push(`Patch: ${outcome.patchFile}`);
+  lines.push(`Manifest: ${outcome.manifestFile}`);
+  if (outcome.captureError) {
+    lines.push(
+      `Handoff capture FAILED: ${outcome.captureError}\nThe worktree, branch, and artifacts were preserved for recovery — do not assume the patch is complete.`,
+    );
+  } else if (outcome.cleanup === "removed") {
+    lines.push("Lane removed: no changes were captured, so the worktree and branch were cleaned up.");
+  } else {
+    lines.push(
+      `Lane preserved for review/merge: ${outcome.cleanupReason ?? "changes must be reviewed before cleanup"}. ` +
+        `Review read-only from ${outcome.patchFile ?? "the manifest"}, merge it yourself (git merge ${outcome.branch} or git apply), then clean up with subagent_worktrees({ action: "cleanup", lane: "${outcome.laneId}" }).`,
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -603,6 +668,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Isolated worktree lane for this run, when spawned with `worktree: true`. */
+  worktree?: { allocation: WorktreeAllocation; artifactDir: string };
 }
 
 interface SubagentRuntime {
@@ -1162,6 +1229,19 @@ async function launchSubagent(
   const driver = getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
+  // Preflight and allocate the isolated lane before anything is launched: a
+  // dirty or non-Git source checkout rejects the spawn without side effects.
+  let worktreeAllocation: WorktreeAllocation | undefined;
+  if (params.worktree) {
+    worktreeAllocation = allocateWorktree({
+      cwd: effectiveCwd ?? ctx.cwd,
+      label: params.name,
+      laneId: id,
+      baseRef: params.baseRef,
+    });
+  }
+  const childCwd = worktreeAllocation?.path ?? effectiveCwd;
+
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentPane(params.name);
   if (params.task) {
@@ -1215,7 +1295,7 @@ async function launchSubagent(
     artifactDir,
     sessionDir,
     subagentSessionFile,
-    effectiveCwd,
+    effectiveCwd: childCwd,
     localAgentDir,
     effectiveAutoExit,
     effectiveInteractive,
@@ -1262,6 +1342,7 @@ async function launchSubagent(
     sentinelFile: built.sentinelFile,
     interactive: effectiveInteractive,
     runtimePlan,
+    ...(worktreeAllocation ? { worktree: { allocation: worktreeAllocation, artifactDir } } : {}),
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -1273,11 +1354,86 @@ async function launchSubagent(
 }
 
 /**
+ * Capture the lane handoff once the child is terminal, then clean up only the
+ * lanes that produced no changes at all. Lanes with work are preserved so the
+ * parent can review and merge them; removal stays an explicit action.
+ */
+function finalizeWorktreeLane(
+  running: RunningSubagent,
+  result: SubagentResult,
+): SubagentResult {
+  const lane = running.worktree;
+  if (!lane) return result;
+
+  const terminalState = {
+    status:
+      result.error === "cancelled"
+        ? ("cancelled" as const)
+        : result.exitCode === 0
+          ? ("completed" as const)
+          : ("failed" as const),
+    exitCode: result.exitCode,
+  };
+
+  let manifest: HandoffManifest | null = null;
+  let captureError: string | undefined;
+  try {
+    manifest = captureHandoff({
+      allocation: lane.allocation,
+      laneId: running.id,
+      artifactDir: lane.artifactDir,
+      name: running.name,
+      agent: running.agent,
+      terminalState,
+    });
+    if (!manifest.capture.ok) captureError = manifest.capture.error ?? "unknown error";
+  } catch (error: any) {
+    captureError = error?.message ?? String(error);
+  }
+
+  const manifestFile = manifestFileFor(lane.artifactDir, running.id);
+  let cleanup: WorktreeLaneOutcome["cleanup"] = "preserved";
+  let cleanupReason: string | undefined = "changes await review before cleanup";
+
+  if (captureError) {
+    cleanupReason = "handoff capture failed";
+  } else if (manifest && manifest.changedPaths.length === 0 && manifest.childCommits === 0) {
+    const removed = removeLane(manifestFile, { by: `subagent:${running.name}` });
+    cleanup = removed.removed ? "removed" : "preserved";
+    cleanupReason = removed.removed ? undefined : removed.reason;
+  }
+
+  return {
+    ...result,
+    worktreeLane: {
+      laneId: running.id,
+      branch: lane.allocation.branch,
+      worktree: lane.allocation.path,
+      manifestFile,
+      ...(manifest && existsSync(manifest.patchFile) ? { patchFile: manifest.patchFile } : {}),
+      changedPaths: manifest?.changedPaths.length ?? 0,
+      childCommits: manifest?.childCommits ?? 0,
+      ...(captureError ? { captureError } : {}),
+      cleanup,
+      ...(cleanupReason ? { cleanupReason } : {}),
+    },
+  };
+}
+
+/**
  * Watch a launched subagent until it exits. Polls for completion, extracts
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
 async function watchSubagent(
+  running: RunningSubagent,
+  signal: AbortSignal,
+): Promise<SubagentResult> {
+  const result = await watchSubagentRun(running, signal);
+  return finalizeWorktreeLane(running, result);
+}
+
+async function watchSubagentRun(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
@@ -1544,7 +1700,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ) {
           throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
         }
-        const running = await launchSubagent(params, ctx, parentThinking);
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx, parentThinking);
+        } catch (error: any) {
+          return {
+            content: [{ type: "text", text: `Error: ${error?.message ?? String(error)}` }],
+            details: { error: error?.message ?? String(error), status: "rejected" },
+          };
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1590,9 +1754,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
+            const presentation = [
+              basePresentation,
+              result.worktreeLane ? formatWorktreeLane(result.worktreeLane) : "",
+              running.runtimePlan?.runtimeMismatch
+                ? `Runtime warning: ${running.runtimePlan.runtimeMismatch}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n\n");
 
             completionApi.sendMessage(
               {
@@ -1609,6 +1779,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+                  ...(result.worktreeLane ? { worktreeLane: result.worktreeLane } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1658,6 +1829,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
             status: "started",
+            ...(running.worktree
+              ? {
+                  worktree: {
+                    branch: running.worktree.allocation.branch,
+                    path: running.worktree.allocation.path,
+                    baseCommit: running.worktree.allocation.baseCommit,
+                  },
+                }
+              : {}),
           },
         };
       },
@@ -1770,6 +1950,238 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_worktrees tool ──
+  if (shouldRegister("subagent_worktrees"))
+    pi.registerTool({
+      name: "subagent_worktrees",
+      label: "Subagent Worktrees",
+      description:
+        "Inspect and maintain the Git worktree lanes created by isolated subagent spawns (worktree: true). " +
+        "action=\"status\" (default) is read-only: it lists each lane's branch, worktree, captured patch, review/merge evidence, and whether it can be removed. " +
+        "action=\"cleanup\" removes a lane's worktree and branch, revalidating ownership, checked-out branch, head commit, and a clean tree immediately before removal; lanes that fail any check are preserved. " +
+        "action=\"record\" writes a reviewer verdict or merge attestation into a lane's manifest. " +
+        "Merging is never automatic: apply the lane branch or patch yourself, then record the merge commit.",
+      promptSnippet:
+        "Inspect and clean up isolated subagent worktree lanes: action status (read-only), cleanup (removes one lane or every eligible lane), record (review verdict / merge attestation).",
+      parameters: Type.Object({
+        action: Type.Optional(
+          Type.Union([Type.Literal("status"), Type.Literal("cleanup"), Type.Literal("record")], {
+            description: "status (default), cleanup, or record",
+          }),
+        ),
+        lane: Type.Optional(
+          Type.String({
+            description:
+              "Lane id, manifest path, or \"eligible\" (cleanup: every lane that passes all checks). Omit for status to list all lanes in this session.",
+          }),
+        ),
+        verdict: Type.Optional(
+          Type.Union([Type.Literal("BLOCK"), Type.Literal("OK"), Type.Literal("OK with notes")], {
+            description: "record: reviewer verdict for the lane's captured head",
+          }),
+        ),
+        reviewer: Type.Optional(Type.String({ description: "record: who reviewed" })),
+        notes: Type.Optional(Type.String({ description: "record: review notes" })),
+        mergeCommit: Type.Optional(
+          Type.String({ description: "record: commit that merged the lane branch" }),
+        ),
+        attestor: Type.Optional(
+          Type.String({ description: "record: who applied the merge and confirmed the evidence" }),
+        ),
+        postMergeChecks: Type.Optional(
+          Type.String({ description: "record: checks run after the merge" }),
+        ),
+      }),
+
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const artifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+        const action = params.action ?? "status";
+        const lanes = listLanes(artifactDir);
+
+        const select = (scope: string | undefined): typeof lanes => {
+          if (!scope || scope === "eligible") return lanes;
+          const manifestFile = scope.startsWith("/") ? scope : manifestFileFor(artifactDir, scope);
+          const manifest = readManifest(manifestFile);
+          return manifest ? [{ manifest, manifestFile }] : [];
+        };
+
+        if (action === "status") {
+          const targets = select(params.lane);
+          if (targets.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: params.lane
+                    ? `No worktree lane matching "${params.lane}" in this session.`
+                    : "No isolated worktree lanes in this session.",
+                },
+              ],
+              details: { lanes: [] },
+            };
+          }
+
+          const inspections: LaneInspection[] = [];
+          const lines: string[] = [];
+          for (const target of targets) {
+            const inspection = inspectLane(target.manifest, target.manifestFile);
+            inspections.push(inspection);
+            const evidence = [
+              inspection.review ? `review ${inspection.review.verdict}` : undefined,
+              inspection.merge ? `merged ${inspection.merge.commit.slice(0, 8)}` : undefined,
+              `cleanup ${inspection.cleanupStatus}`,
+            ]
+              .filter(Boolean)
+              .join(", ");
+            lines.push(
+              `• ${inspection.laneId} ${inspection.branch} — ${inspection.changedPaths.length} changed path(s)` +
+                `${evidence ? ` — ${evidence}` : ""}`,
+              `  worktree ${inspection.worktree}`,
+              `  manifest ${inspection.manifestFile}`,
+              inspection.removable
+                ? "  removable yes"
+                : `  removable no — ${inspection.blockers.join("; ")}`,
+            );
+          }
+          const removable = inspections.filter((entry) => entry.removable).length;
+          lines.push(
+            `\n${inspections.length} lane(s), ${removable} removable. Removal is explicit: subagent_worktrees({ action: "cleanup", lane: "<id>" }).`,
+          );
+
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { lanes: inspections },
+          };
+        }
+
+        if (action === "cleanup") {
+          if (!params.lane) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: 'cleanup needs a lane: subagent_worktrees({ action: "cleanup", lane: "<id>" }) or lane: "eligible".',
+                },
+              ],
+              details: { error: "lane required" },
+            };
+          }
+          const targets = select(params.lane);
+          if (targets.length === 0) {
+            return {
+              content: [{ type: "text", text: `No worktree lane matching "${params.lane}".` }],
+              details: { removed: [], preserved: [] },
+            };
+          }
+
+          const removed: string[] = [];
+          const preserved: Array<{ laneId: string; reason?: string }> = [];
+          const skipped: string[] = [];
+          for (const target of targets) {
+            const outcome = removeLane(target.manifestFile, { by: "parent" });
+            if (outcome.removed) {
+              removed.push(target.manifest.laneId);
+            } else if (params.lane === "eligible") {
+              // Nothing is wrong with the others; they were simply not eligible.
+              skipped.push(`${target.manifest.laneId} (${outcome.reason})`);
+            } else {
+              preserved.push({ laneId: target.manifest.laneId, reason: outcome.reason });
+            }
+          }
+
+          const lines = [
+            removed.length > 0 ? `Removed: ${removed.join(", ")}` : "Removed: none",
+            ...preserved.map((entry) => `Preserved ${entry.laneId}: ${entry.reason}`),
+            ...skipped.map((entry) => `Not eligible: ${entry}`),
+          ];
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { removed, preserved },
+          };
+        }
+
+        // action === "record"
+        if (!params.lane) {
+          return {
+            content: [
+              { type: "text", text: 'record needs a lane and either verdict or mergeCommit.' },
+            ],
+            details: { error: "lane required" },
+          };
+        }
+        const review = params.verdict
+          ? {
+              verdict: params.verdict,
+              reviewer: params.reviewer ?? "parent",
+              ...(params.notes ? { notes: params.notes } : {}),
+            }
+          : undefined;
+        const merge = params.mergeCommit
+          ? {
+              commit: params.mergeCommit,
+              attestor: params.attestor ?? "parent",
+              ...(params.postMergeChecks ? { postMergeChecks: params.postMergeChecks } : {}),
+            }
+          : undefined;
+        if (!review && !merge) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "record needs a verdict (review) or a mergeCommit (merge attestation).",
+              },
+            ],
+            details: { error: "nothing to record" },
+          };
+        }
+
+        const targets = select(params.lane);
+        if (targets.length === 0) {
+          return {
+            content: [{ type: "text", text: `No worktree lane matching "${params.lane}".` }],
+            details: { error: "lane not found" },
+          };
+        }
+
+        const results = targets.map((target) => ({
+          laneId: target.manifest.laneId,
+          ...recordLaneEvidence(target.manifestFile, { review, merge }),
+        }));
+        const failures = results.filter((entry) => !entry.ok);
+        return {
+          content: [
+            {
+              type: "text",
+              text: failures.length
+                ? failures.map((entry) => `Failed ${entry.laneId}: ${entry.error}`).join("\n")
+                : `Recorded evidence for ${results.map((entry) => entry.laneId).join(", ")}.`,
+            },
+          ],
+          details: { results },
+        };
+      },
+
+      renderCall(args, theme) {
+        const action = typeof args.action === "string" ? args.action : "status";
+        const lane = typeof args.lane === "string" && args.lane ? ` ${args.lane}` : "";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(`worktrees ${action}${lane}`)),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("toolOutput", text), 0, 0);
       },
     });
 

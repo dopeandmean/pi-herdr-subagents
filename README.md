@@ -73,14 +73,15 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 1 subagent-only tool:
 
-| Tool                 | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| Tool                  | Description                                                                                 |
+| --------------------- | ------------------------------------------------------------------------------------------- |
+| `subagent`            | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
+| `subagent_interrupt`  | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagents_list`      | List available agent definitions                                                            |
+| `subagent_resume`     | Resume a previous sub-agent session (async)                                                 |
+| `subagent_worktrees`  | Inspect, record evidence for, and clean up isolated worktree lanes                          |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -239,6 +240,39 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `worktree`             | boolean | `false`        | Run the child in its own Git worktree and branch (see [Isolated Worktree Lanes](#isolated-worktree-lanes)) |
+| `baseRef`              | string  | `HEAD`         | Git ref the isolated worktree branches from (only with `worktree: true`)                          |
+
+---
+
+## Isolated Worktree Lanes
+
+Parallel writers normally share one checkout. With `worktree: true` the child gets its own Git worktree and branch, so two workers cannot see or clobber each other's edits:
+
+```typescript
+subagent({ name: "Parser", agent: "worker", worktree: true, task: "Rewrite the parser..." });
+subagent({ name: "Tests", agent: "worker", worktree: true, task: "Add parser tests..." });
+```
+
+Launch is fail-closed. The extension resolves the repository root for the child's `cwd`, requires a clean source checkout, then creates the lane before any pane exists: a dirty or non-Git checkout rejects the spawn with the repository untouched — nothing is stashed, reset, or silently absorbed into the lane. Each lane gets a unique branch (`pi-subagents/<label>-<id>`) and a worktree outside the checkout at `<parent-of-repo>/worktrees/<repo>/pi-worktree-<id>`; set `PI_SUBAGENTS_WORKTREE_DIR` to relocate that root. Cwd-local runtime metadata written by pi tooling (default `.pi-lens-probe-home`, override with `PI_SUBAGENTS_WORKTREE_EXCLUDE`) is ignored by the clean-tree gate and excluded from capture, so it never reaches a patch.
+
+When the child exits, its complete change set against the recorded base is captured — tracked, untracked, renamed, and binary files — into the session's artifact directory without touching the lane's index:
+
+```
+artifacts/<session-id>/subagent-worktrees/<lane-id>/
+  patch.diff      applyable patch (git apply -p1)
+  manifest.json   base/head commits, branch, worktree, changed paths, terminal state, review/merge evidence
+```
+
+The manifest path, branch, and patch summary arrive with the completion message. Lanes that changed nothing are removed automatically; lanes with work are preserved so you can review and merge them:
+
+```typescript
+subagent_worktrees({ action: "status" });                                   // read-only plan
+subagent_worktrees({ action: "record", lane: "1a2b3c4d", verdict: "OK", reviewer: "reviewer" });
+subagent_worktrees({ action: "cleanup", lane: "1a2b3c4d" });                // or lane: "eligible"
+```
+
+Cleanup revalidates repository ownership, checked-out branch, head commit, and a clean tree immediately before removing anything, and preserves the lane on any mismatch. Merging is never automatic: apply the branch or patch yourself (`git merge pi-subagents/worker-1a2b3c4d`), then record the merge commit with `action: "record"`. Reviewers read the captured patch read-only; the recorded verdict is bound to the lane's exact captured head.
 
 ---
 

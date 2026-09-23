@@ -42,6 +42,15 @@ git diff HEAD~N  # where N = number of commits in the implementation
 
 Adjust based on what the task says to review.
 
+When the task names an isolated worktree lane, review from the captured evidence and keep the lane read-only:
+
+```bash
+# The lane's manifest lists baseCommit, headCommit, branch, worktree, and changedPaths
+cd <worktree> && git diff <baseCommit>   # or read the manifest's patchFile
+```
+
+Report your verdict against the manifest's `headCommit` — it identifies exactly what you reviewed — and never edit, commit, merge, or remove the lane itself.
+
 ### 3. Run Tests (if applicable)
 
 ```bash
@@ -81,6 +90,7 @@ Use the `write` tool to save the review. The orchestrator provides the target pa
 ## Constraints
 
 - Do NOT modify any code
+- Do NOT merge, commit, or clean up an isolated worktree lane; report a verdict instead
 - DO provide specific, actionable feedback
 - DO run tests and report results
 
