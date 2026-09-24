@@ -1,0 +1,132 @@
+import { describe, it, after } from "node:test";
+import assert from "node:assert/strict";
+import { isTerminalAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+
+describe("herdr.ts", () => {
+  describe("isTerminalAvailable", () => {
+    it("returns boolean based on HERDR_ENV", () => {
+      const result = isTerminalAvailable();
+      assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("herdr command construction", () => {
+    it("targets the current workspace when creating a subagent tab", () => {
+      assert.deepEqual(__herdrTest__.buildTabCreateArgs("reviewer", "/repo", "workspace-2"), [
+        "tab",
+        "create",
+        "--workspace",
+        "workspace-2",
+        "--label",
+        "reviewer",
+        "--cwd",
+        "/repo",
+        "--no-focus",
+      ]);
+    });
+
+    it("constructs report-metadata arguments with normalized task token", () => {
+      assert.deepEqual(
+        __herdrTest__.buildPaneReportTaskArgs("pane-1", "Inspect failing test suite", "pi"),
+        [
+          "pane",
+          "report-metadata",
+          "pane-1",
+          "--source",
+          "pi",
+          "--token",
+          "task=Inspect failing test suite",
+        ],
+      );
+    });
+
+    it("flattens multi-line and tab-padded tasks into a single line", () => {
+      assert.deepEqual(
+        __herdrTest__.buildPaneReportTaskArgs(
+          "pane-2",
+          "  Line 1\n\tLine 2\r\nLine 3  ",
+          "pi",
+        ),
+        [
+          "pane",
+          "report-metadata",
+          "pane-2",
+          "--source",
+          "pi",
+          "--token",
+          "task=Line 1 Line 2 Line 3",
+        ],
+      );
+    });
+  });
+
+  describe("herdr response parsing", () => {
+    it("extracts root pane id from a tab create response", () => {
+      const output = JSON.stringify({
+        result: {
+          tab: { tab_id: "1:2" },
+          root_pane: { pane_id: "1-2" },
+        },
+      });
+      assert.equal(__herdrTest__.extractHerdrRootPaneId(output, "tab create"), "1-2");
+    });
+
+    it("throws on malformed herdr JSON", () => {
+      assert.throws(
+        () => __herdrTest__.extractHerdrRootPaneId("not json", "tab create"),
+        /Unexpected herdr tab create output/,
+      );
+    });
+
+    it("parses pane-not-found JSON from stderr-shaped errors", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+        stdout: "",
+      });
+      assert.deepEqual(result, { kind: "missing", error: "pane gone" });
+    });
+
+    it("continues from non-JSON stderr to structured stdout", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "warning: connection closed",
+        stdout: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+      });
+      assert.deepEqual(result, { kind: "missing", error: "pane gone" });
+    });
+
+    it("returns unavailable when both error streams are non-JSON", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        message: "command failed",
+        stderr: "warning: connection closed",
+        stdout: "not json either",
+      });
+      assert.deepEqual(result, { kind: "unavailable", error: "command failed" });
+    });
+
+    it("recognizes plain-text pane_not_found on stderr", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "pane_not_found: pane w1:p1 not found",
+        stdout: "unrelated output",
+      });
+      assert.deepEqual(result, {
+        kind: "missing",
+        error: "pane_not_found: pane w1:p1 not found",
+      });
+    });
+
+    it("recognizes plain-text not_found on stdout after malformed stderr", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "{malformed json",
+        stdout: "not_found: pane w1:p1",
+      });
+      assert.deepEqual(result, { kind: "missing", error: "not_found: pane w1:p1" });
+    });
+
+    it("normalizes unknown agent_status values", () => {
+      const result = __herdrTest__.parsePaneGetOutput(JSON.stringify({
+        result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
+      }), "w1:p1");
+      assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
+    });
+  });
+});

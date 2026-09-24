@@ -4,13 +4,13 @@ import { existsSync, mkdirSync } from "node:fs";
 import { terminalSetupHint, createSubagentPane, runScriptInPane, closePane, interruptPane, shellQuote, readPane, readPaneAsync, inspectPane, setPaneTask } from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
 import { renderSubagentWidgetLines } from "./widget.ts";
+import { isThinkingLevel, resolveRuntimePlan, wrapPiModelRegistry, type ResolvedRuntimePlan, type ThinkingLevel } from "./runtime-routing.ts";
 import { type SubagentLaunchParams } from "./params.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 import { getDefaultSessionDirFor, loadAgentDefaults, resolveDenyTools, resolveEffectiveAutoExit, resolveEffectiveInteractive, resolveLaunchBehavior, resolveSubagentPaths } from "./discovery.ts";
-import { resolveRuntimePlan, wrapPiModelRegistry, type ResolvedRuntimePlan, type ThinkingLevel } from "./runtime-routing.ts";
 import { getHarnessDriver } from "./harness/index.ts";
 import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 import { findLastAssistantMessage, findObservedSessionRuntime, getNewEntries, seedSubagentSessionFile } from "./session.ts";
@@ -670,7 +670,7 @@ export async function launchSubagent(
     { model: params.model, thinking: params.thinking },
     {
       model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-      thinking: agentDefs?.thinking,
+      thinking: agentDefs?.thinking && isThinkingLevel(agentDefs.thinking) ? agentDefs.thinking : undefined,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),

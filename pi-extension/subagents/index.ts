@@ -8,26 +8,11 @@ import { join } from "node:path";
 import {
   buildAvailableAgentCatalog,
   discoverAgentDefinitions,
-  loadAgentDefaults,
-  resolveDenyTools,
-  resolveEffectiveAutoExit,
-  resolveEffectiveInteractive,
-  resolveEffectiveSessionMode,
-  resolveLaunchBehavior,
 } from "./discovery.ts";
-import { buildSubagentToolAllowlist, buildPiPromptArgs } from "./harness/index.ts";
 import { buildSubagentRoutingGuidelines, setRoutingGuidelines } from "./guidelines.ts";
 import { loadModelConfig } from "./model-config.ts";
 import {
   cleanupSubagentsForShutdown,
-  formatElapsed,
-  getShellReadyDelayMs,
-  handleSubagentInterrupt,
-  observeRunningSubagent,
-  requestSubagentInterrupt,
-  resolveInterruptTarget,
-  resolveResultPresentation,
-  resolveResumeLaunchBehavior,
   runningSubagents,
   runtime,
   startStatusRefresh,
@@ -42,28 +27,6 @@ import { registerSubagentTools } from "./tools/index.ts";
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 const modelConfig = loadModelConfig();
-
-export const __test__ = {
-  getShellReadyDelayMs,
-  loadAgentDefaults,
-  discoverAgentDefinitions,
-  buildAvailableAgentCatalog,
-  resolveEffectiveSessionMode,
-  resolveLaunchBehavior,
-  resolveEffectiveAutoExit,
-  resolveEffectiveInteractive,
-  buildSubagentToolAllowlist,
-  buildPiPromptArgs,
-  observeRunningSubagent,
-  resolveDenyTools,
-  resolveInterruptTarget,
-  requestSubagentInterrupt,
-  handleSubagentInterrupt,
-  resolveResultPresentation,
-  resolveResumeLaunchBehavior,
-  runningSubagents,
-  formatElapsed,
-};
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
