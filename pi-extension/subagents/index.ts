@@ -1,17 +1,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
+import { Type } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  readdirSync,
   readFileSync,
   writeFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
@@ -28,11 +26,23 @@ import {
 import { waitForCompletion } from "./completion.ts";
 import { SENTINEL_TRAILER } from "./handoff.ts";
 import { renderSubagentWidgetLines } from "./widget.ts";
+import { SubagentParams, type SubagentLaunchParams } from "./params.ts";
+import {
+  buildAvailableAgentCatalog,
+  discoverAgentDefinitions,
+  getDefaultSessionDirFor,
+  loadAgentDefaults,
+  resolveDenyTools,
+  resolveEffectiveAutoExit,
+  resolveEffectiveInteractive,
+  resolveEffectiveSessionMode,
+  resolveLaunchBehavior,
+  resolveSubagentPaths,
+} from "./discovery.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
   wrapPiModelRegistry,
-  THINKING_LEVELS,
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
@@ -41,7 +51,7 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -132,345 +142,7 @@ function buildSubagentRoutingGuidelines(
 
 const subagentRoutingGuidelines = buildSubagentRoutingGuidelines();
 
-const ThinkingLevelSchema = Type.Union(
-  THINKING_LEVELS.map((level) => Type.Literal(level)),
-  {
-    description:
-      "Pi thinking level. Omit to use a named agent's thinking default, then the parent level. Passing a value explicitly overrides agent frontmatter for this spawn.",
-  },
-);
 
-const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
-  agent: Type.Optional(
-    Type.String({
-      description:
-        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide model, thinking, tools, skills, and role instructions.",
-    }),
-  ),
-  systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
-  ),
-  model: Type.Optional(
-    Type.String({
-      description:
-        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides agent frontmatter for this spawn.",
-    }),
-  ),
-  thinking: Type.Optional(ThinkingLevelSchema),
-  skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
-  ),
-  tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
-  ),
-  cwd: Type.Optional(
-    Type.String({
-      description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
-    }),
-  ),
-  fork: Type.Optional(
-    Type.Boolean({
-      description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
-    }),
-  ),
-  worktree: Type.Optional(
-    Type.Boolean({
-      description:
-        "Run this child in its own Git worktree on a new branch, so parallel writers cannot touch each other or the source checkout. Requires a clean Git checkout; the spawn is rejected (nothing launched, nothing modified) otherwise. Changes are captured as a patch + manifest when the child exits.",
-    }),
-  ),
-  baseRef: Type.Optional(
-    Type.String({
-      description:
-        "Git ref the isolated worktree branches from (only with worktree: true). Defaults to HEAD.",
-    }),
-  ),
-  interactive: Type.Optional(
-    Type.Boolean({
-      description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
-    }),
-  ),
-  resumeSessionId: Type.Optional(
-    Type.String({
-      description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
-    }),
-  ),
-});
-
-import {
-  type AgentDefinition,
-  type AgentSource,
-  type DiscoveredAgent,
-  type SubagentSessionMode,
-} from "./agent-definition.ts";
-
-/** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set([
-  "subagent",
-  "subagent_interrupt",
-  "subagents_list",
-  "subagent_resume",
-]);
-
-/**
- * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
- */
-function resolveDenyTools(agentDefs: AgentDefinition | null): Set<string> {
-  const denied = new Set<string>();
-  if (!agentDefs) return denied;
-
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
-  }
-
-  // deny-tools: explicit list
-  if (agentDefs.denyTools) {
-    for (const t of agentDefs.denyTools
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)) {
-      denied.add(t);
-    }
-  }
-
-  return denied;
-}
-
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
-function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-}
-
-function getBundledAgentsDir(): string {
-  return join(SUBAGENTS_DIR, "../../agents");
-}
-
-function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  if (!match) return undefined;
-  const value = match[1].trim();
-  if (
-    value.length >= 2 &&
-    ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-  ) {
-    return value.slice(1, -1);
-  }
-  return value;
-}
-
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-  return value != null ? value === "true" : undefined;
-}
-
-function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
-  if (value === "standalone" || value === "lineage-only" || value === "fork") {
-    return value;
-  }
-  return undefined;
-}
-
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-
-  const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
-
-  return {
-    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
-    description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
-    systemPromptMode:
-      systemPromptMode === "replace"
-        ? "replace"
-        : systemPromptMode === "append"
-          ? "append"
-          : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
-    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
-    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
-    cwd: getFrontmatterValue(frontmatter, "cwd"),
-    cli: getFrontmatterValue(frontmatter, "cli"),
-    commandTemplate:
-      getFrontmatterValue(frontmatter, "command") ??
-      getFrontmatterValue(frontmatter, "command-template"),
-    body: body || undefined,
-    disableModelInvocation:
-      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
-  };
-}
-
-function discoverAgentDefinitions(): DiscoveredAgent[] {
-  const agents = new Map<string, DiscoveredAgent>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: getBundledAgentsDir(), source: "package" },
-    { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-  ];
-
-  for (const { path: dir, source } of dirs) {
-    if (!existsSync(dir)) continue;
-    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      try {
-        const parsed = parseAgentDefinition(
-          readFileSync(join(dir, file), "utf8"),
-          file.replace(/\.md$/, ""),
-        );
-        if (!parsed) continue;
-        agents.set(parsed.name, { ...parsed, source });
-      } catch {
-        // Skip unreadable or racy entries rather than aborting discovery
-        // for every other agent definition.
-      }
-    }
-  }
-
-  return [...agents.values()];
-}
-
-function buildAvailableAgentCatalog(
-  agents: DiscoveredAgent[],
-  limit = 24,
-  config: ModelConfig = modelConfig,
-): string {
-  const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
-  const visible = sorted.slice(0, limit);
-  const lines = [
-    "Available named subagents (choose by role; omit model/thinking to use agent defaults):",
-  ];
-
-  for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
-    const defaults = [
-      effectiveModel ? `model ${effectiveModel}` : undefined,
-      agent.thinking ? `thinking ${agent.thinking}` : undefined,
-    ].filter(Boolean);
-    const runtime = defaults.length > 0 ? `; defaults: ${defaults.join(", ")}` : "";
-    const description = agent.description ? ` — ${agent.description}` : "";
-    lines.push(`- ${agent.name} [${agent.source}${runtime}]${description}`);
-  }
-
-  if (visible.length === 0) lines.push("- none discovered; use a bare spawn");
-  if (sorted.length > visible.length) {
-    lines.push(`- … ${sorted.length - visible.length} more named subagents omitted`);
-  }
-
-  return lines.join("\n");
-}
-
-function resolveSubagentPaths(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefinition | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
-  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-  const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
-  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
-}
-
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
-  const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  const sessionDir = join(agentDir, "sessions", safePath);
-  if (!existsSync(sessionDir)) {
-    mkdirSync(sessionDir, { recursive: true });
-  }
-  return sessionDir;
-}
-
-function resolveEffectiveSessionMode(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefinition | null,
-): SubagentSessionMode {
-  if (params.fork) return "fork";
-  return agentDefs?.sessionMode ?? "standalone";
-}
-
-function resolveLaunchBehavior(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefinition | null,
-): {
-  sessionMode: SubagentSessionMode;
-  seededSessionMode: "lineage-only" | "fork" | null;
-  inheritsConversationContext: boolean;
-  taskDelivery: "direct" | "artifact";
-} {
-  const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
-  const inheritsConversationContext = sessionMode === "fork";
-  return {
-    sessionMode,
-    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
-    inheritsConversationContext,
-    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
-  };
-}
-
-/**
- * Decide whether a subagent is interactive (user-driven, long-running).
- *
- * Resolution order:
- *   1. Explicit `interactive` tool parameter wins.
- *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
- */
-function resolveEffectiveAutoExit(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefinition | null,
-): boolean {
-  // Named agents preserve their declared behavior. Bare tool calls are
-  // autonomous by default, including full-context forks: `fork` controls
-  // context inheritance, not whether the child should remain open. Interactive
-  // flows such as /iterate opt out explicitly with `interactive: true`.
-  if (agentDefs) return agentDefs.autoExit ?? false;
-  return params.interactive !== true;
-}
-
-function resolveEffectiveInteractive(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefinition | null,
-): boolean {
-  if (params.interactive != null) return params.interactive;
-  if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !resolveEffectiveAutoExit(params, agentDefs);
-}
-
-function loadAgentDefaults(agentName: string): DiscoveredAgent | null {
-  // Resolve through the same name-keyed map discoverAgentDefinitions() builds
-  // for the tool-guidance catalog, so a name advertised there always resolves
-  // to the same definition here — even when an agent's frontmatter `name`
-  // differs from its filename.
-  return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
-}
 
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -968,7 +640,7 @@ function startWidgetRefresh() {
  * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: SubagentLaunchParams,
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
@@ -1393,6 +1065,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     runtime.agentCatalog = buildAvailableAgentCatalog(
       discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
+      24,
+      modelConfig,
     );
     const refreshedGuidelines = buildSubagentRoutingGuidelines(
       runtime.modelCatalog,
