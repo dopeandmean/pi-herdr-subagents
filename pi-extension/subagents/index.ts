@@ -8,11 +8,13 @@ import { join } from "node:path";
 import {
   buildAvailableAgentCatalog,
   discoverAgentDefinitions,
+  loadAgentDefaults,
 } from "./discovery.ts";
 import { buildSubagentRoutingGuidelines, setRoutingGuidelines } from "./guidelines.ts";
 import { loadModelConfig } from "./model-config.ts";
 import {
   cleanupSubagentsForShutdown,
+  formatElapsed,
   runningSubagents,
   runtime,
   startStatusRefresh,
