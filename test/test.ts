@@ -12,7 +12,7 @@ import {
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
-} from "../pi-extension/subagents/index.ts";
+} from "../pi-extension/subagents/run.ts";
 
 import {
   getLeafId,
