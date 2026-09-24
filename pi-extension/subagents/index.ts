@@ -59,11 +59,9 @@ import {
   captureHandoff,
   inspectLane,
   listLanes,
-  manifestFileFor,
-  readManifest,
   recordLaneEvidence,
   removeLane,
-  type HandoffManifest,
+  type LaneEntry,
   type LaneInspection,
   type WorktreeAllocation,
 } from "./worktree.ts";
@@ -595,7 +593,7 @@ interface WorktreeLaneOutcome {
   laneId: string;
   branch: string;
   worktree: string;
-  manifestFile: string;
+  manifestFile?: string;
   patchFile?: string;
   changedPaths: number;
   childCommits: number;
@@ -612,7 +610,7 @@ function formatWorktreeLane(outcome: WorktreeLaneOutcome): string {
     (outcome.childCommits > 0 ? `, ${outcome.childCommits} child commit(s)` : "");
   const lines = [`Worktree lane ${outcome.branch} at ${outcome.worktree}`, `Changes: ${changed}`];
   if (outcome.patchFile) lines.push(`Patch: ${outcome.patchFile}`);
-  lines.push(`Manifest: ${outcome.manifestFile}`);
+  if (outcome.manifestFile) lines.push(`Manifest: ${outcome.manifestFile}`);
   if (outcome.captureError) {
     lines.push(
       `Handoff capture FAILED: ${outcome.captureError}\nThe worktree, branch, and artifacts were preserved for recovery — do not assume the patch is complete.`,
@@ -1325,10 +1323,10 @@ function finalizeWorktreeLane(
     exitCode: result.exitCode,
   };
 
-  let manifest: HandoffManifest | null = null;
+  let entry: LaneEntry | null = null;
   let captureError: string | undefined;
   try {
-    manifest = captureHandoff({
+    entry = captureHandoff({
       allocation: lane.allocation,
       laneId: running.id,
       artifactDir: lane.artifactDir,
@@ -1336,19 +1334,19 @@ function finalizeWorktreeLane(
       agent: running.agent,
       terminalState,
     });
-    if (!manifest.capture.ok) captureError = manifest.capture.error ?? "unknown error";
+    if (!entry.manifest.capture.ok) captureError = entry.manifest.capture.error ?? "unknown error";
   } catch (error: any) {
     captureError = error?.message ?? String(error);
   }
 
-  const manifestFile = manifestFileFor(lane.artifactDir, running.id);
+  const manifest = entry?.manifest ?? null;
   let cleanup: WorktreeLaneOutcome["cleanup"] = "preserved";
   let cleanupReason: string | undefined = "changes await review before cleanup";
 
   if (captureError) {
     cleanupReason = "handoff capture failed";
-  } else if (manifest && manifest.changedPaths.length === 0 && manifest.childCommits === 0) {
-    const removed = removeLane(manifestFile, { by: `subagent:${running.name}` });
+  } else if (entry && manifest && manifest.changedPaths.length === 0 && manifest.childCommits === 0) {
+    const removed = removeLane(entry, { by: `subagent:${running.name}` });
     cleanup = removed.removed ? "removed" : "preserved";
     cleanupReason = removed.removed ? undefined : removed.reason;
   }
@@ -1359,7 +1357,7 @@ function finalizeWorktreeLane(
       laneId: running.id,
       branch: lane.allocation.branch,
       worktree: lane.allocation.path,
-      manifestFile,
+      ...(entry ? { manifestFile: entry.manifestFile } : {}),
       ...(manifest && existsSync(manifest.patchFile) ? { patchFile: manifest.patchFile } : {}),
       changedPaths: manifest?.changedPaths.length ?? 0,
       childCommits: manifest?.childCommits ?? 0,
@@ -1954,17 +1952,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionId(),
         );
         const action = params.action ?? "status";
-        const lanes = listLanes(artifactDir);
-
-        const select = (scope: string | undefined): typeof lanes => {
-          if (!scope || scope === "eligible") return lanes;
-          const manifestFile = scope.startsWith("/") ? scope : manifestFileFor(artifactDir, scope);
-          const manifest = readManifest(manifestFile);
-          return manifest ? [{ manifest, manifestFile }] : [];
-        };
+        // "eligible" means every lane; a lane id or manifest path narrows it.
+        const scope = params.lane === "eligible" ? undefined : params.lane;
 
         if (action === "status") {
-          const targets = select(params.lane);
+          const targets = listLanes(artifactDir, scope);
           if (targets.length === 0) {
             return {
               content: [
@@ -1982,7 +1974,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const inspections: LaneInspection[] = [];
           const lines: string[] = [];
           for (const target of targets) {
-            const inspection = inspectLane(target.manifest, target.manifestFile);
+            const inspection = inspectLane(target);
             inspections.push(inspection);
             const evidence = [
               inspection.review ? `review ${inspection.review.verdict}` : undefined,
@@ -2024,7 +2016,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               details: { error: "lane required" },
             };
           }
-          const targets = select(params.lane);
+          const targets = listLanes(artifactDir, scope);
           if (targets.length === 0) {
             return {
               content: [{ type: "text", text: `No worktree lane matching "${params.lane}".` }],
@@ -2036,7 +2028,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const preserved: Array<{ laneId: string; reason?: string }> = [];
           const skipped: string[] = [];
           for (const target of targets) {
-            const outcome = removeLane(target.manifestFile, { by: "parent" });
+            const outcome = removeLane(target, { by: "parent" });
             if (outcome.removed) {
               removed.push(target.manifest.laneId);
             } else if (params.lane === "eligible") {
@@ -2093,7 +2085,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const targets = select(params.lane);
+        const targets = listLanes(artifactDir, scope);
         if (targets.length === 0) {
           return {
             content: [{ type: "text", text: `No worktree lane matching "${params.lane}".` }],
@@ -2103,7 +2095,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const results = targets.map((target) => ({
           laneId: target.manifest.laneId,
-          ...recordLaneEvidence(target.manifestFile, { review, merge }),
+          ...recordLaneEvidence(target, { review, merge }),
         }));
         const failures = results.filter((entry) => !entry.ok);
         return {

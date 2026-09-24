@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 /**
  * Git worktree isolation for subagent lanes: allocation, durable handoff
@@ -40,7 +40,7 @@ const MANIFEST_FILE_NAME = "manifest.json";
  */
 const DEFAULT_RUNTIME_EXCLUDES = [".pi-lens-probe-home"];
 
-export function runtimeExcludePrefixes(): string[] {
+function runtimeExcludePrefixes(): string[] {
   const configured = process.env.PI_SUBAGENTS_WORKTREE_EXCLUDE;
   const entries = configured === undefined ? DEFAULT_RUNTIME_EXCLUDES : configured.split(",");
   return entries
@@ -131,6 +131,12 @@ export interface HandoffManifest {
   createdAt: string;
 }
 
+/** One lane's manifest, with the path it was read from. */
+export interface LaneEntry {
+  manifest: HandoffManifest;
+  manifestFile: string;
+}
+
 export interface LaneInspection {
   laneId: string;
   manifestFile: string;
@@ -177,7 +183,7 @@ function isInside(parent: string, child: string): boolean {
 }
 
 /** Absolute repository root for `cwd`, or null when it is not in a Git work tree. */
-export function resolveRepoRoot(cwd: string): string | null {
+function resolveRepoRoot(cwd: string): string | null {
   const out = tryGit(["rev-parse", "--show-toplevel"], { cwd });
   const root = out?.trim();
   return root ? root : null;
@@ -188,7 +194,7 @@ export function resolveRepoRoot(cwd: string): string | null {
  * branch from a checkout whose contents are fully accounted for, and the
  * caller's work must never be stashed, reset, or silently absorbed.
  */
-export function checkSourceClean(repoRoot: string): {
+function checkSourceClean(repoRoot: string): {
   ok: boolean;
   reason?: string;
   entries: string[];
@@ -220,7 +226,7 @@ function sanitizeLabel(label: string): string {
 }
 
 /** Dedicated worktree root: sibling of the checkout, never inside it. */
-export function resolveWorktreeRoot(repoRoot: string): string {
+function resolveWorktreeRoot(repoRoot: string): string {
   const configured = process.env.PI_SUBAGENTS_WORKTREE_DIR;
   const root = configured
     ? configured.startsWith("~/")
@@ -240,7 +246,7 @@ export function resolveWorktreeRoot(repoRoot: string): string {
   return root;
 }
 
-export function laneDirFor(artifactDir: string, laneId: string): string {
+function laneDirFor(artifactDir: string, laneId: string): string {
   return join(artifactDir, LANES_DIR_NAME, laneId);
 }
 
@@ -336,7 +342,7 @@ export function captureHandoff(options: {
   name: string;
   agent?: string;
   terminalState: LaneTerminalState;
-}): HandoffManifest {
+}): LaneEntry {
   const { allocation, laneId } = options;
   const laneDir = laneDirFor(options.artifactDir, laneId);
   mkdirSync(laneDir, { recursive: true });
@@ -431,14 +437,14 @@ export function captureHandoff(options: {
   }
 
   writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
-  return manifest;
+  return { manifest, manifestFile };
 }
 
-export function manifestFileFor(artifactDir: string, laneId: string): string {
+function manifestFileFor(artifactDir: string, laneId: string): string {
   return join(laneDirFor(artifactDir, laneId), MANIFEST_FILE_NAME);
 }
 
-export function readManifest(manifestFile: string): HandoffManifest | null {
+function readManifest(manifestFile: string): HandoffManifest | null {
   if (!existsSync(manifestFile)) return null;
   try {
     const parsed = JSON.parse(readFileSync(manifestFile, "utf8")) as HandoffManifest;
@@ -448,18 +454,29 @@ export function readManifest(manifestFile: string): HandoffManifest | null {
   }
 }
 
-export function listLanes(
-  artifactDir: string,
-): Array<{ manifest: HandoffManifest; manifestFile: string }> {
+function readLaneEntries(artifactDir: string): LaneEntry[] {
   const root = join(artifactDir, LANES_DIR_NAME);
   if (!existsSync(root)) return [];
-  const lanes: Array<{ manifest: HandoffManifest; manifestFile: string }> = [];
+  const lanes: LaneEntry[] = [];
   for (const entry of readdirSync(root)) {
     const manifestFile = join(root, entry, MANIFEST_FILE_NAME);
     const manifest = readManifest(manifestFile);
     if (manifest) lanes.push({ manifest, manifestFile });
   }
   return lanes.sort((a, b) => a.manifest.createdAt.localeCompare(b.manifest.createdAt));
+}
+
+/**
+ * Lanes recorded for this session, oldest first. `scope` narrows to one lane:
+ * a lane id, or an absolute path to a manifest file.
+ */
+export function listLanes(artifactDir: string, scope?: string): LaneEntry[] {
+  if (!scope) return readLaneEntries(artifactDir);
+  if (isAbsolute(scope)) {
+    const manifest = readManifest(scope);
+    return manifest ? [{ manifest, manifestFile: scope }] : [];
+  }
+  return readLaneEntries(artifactDir).filter((entry) => entry.manifest.laneId === scope);
 }
 
 function registeredWorktrees(repoRoot: string): Map<string, string> {
@@ -481,7 +498,8 @@ function registeredWorktrees(repoRoot: string): Map<string, string> {
  * Read-only verdict on whether a lane may be removed. Runs fresh Git checks
  * every time — the manifest is evidence, never authority.
  */
-export function inspectLane(manifest: HandoffManifest, manifestFile: string): LaneInspection {
+export function inspectLane(entry: LaneEntry): LaneInspection {
+  const { manifest, manifestFile } = entry;
   const blockers: string[] = [];
   const inspection: LaneInspection = {
     laneId: manifest.laneId,
@@ -574,14 +592,15 @@ export function inspectLane(manifest: HandoffManifest, manifestFile: string): La
  * preserves the lane (branch, worktree, evidence) whenever anything is off.
  */
 export function removeLane(
-  manifestFile: string,
+  entry: LaneEntry,
   options: { by?: string } = {},
 ): { removed: boolean; reason?: string; inspection: LaneInspection | null } {
+  const { manifestFile } = entry;
   const manifest = readManifest(manifestFile);
   if (!manifest) {
     return { removed: false, reason: "manifest missing or malformed", inspection: null };
   }
-  const inspection = inspectLane(manifest, manifestFile);
+  const inspection = inspectLane({ manifest, manifestFile });
   if (!inspection.removable) {
     return { removed: false, reason: inspection.blockers.join("; "), inspection };
   }
@@ -625,12 +644,13 @@ function writeManifestFile(manifestFile: string, manifest: HandoffManifest): voi
  * merge evidence cannot be attached to work the reviewer never saw.
  */
 export function recordLaneEvidence(
-  manifestFile: string,
+  entry: LaneEntry,
   evidence: {
     review?: { verdict: LaneReview["verdict"]; reviewer: string; notes?: string };
     merge?: { commit: string; attestor: string; postMergeChecks?: string };
   },
 ): { ok: boolean; error?: string; manifest?: HandoffManifest } {
+  const { manifestFile } = entry;
   const manifest = readManifest(manifestFile);
   if (!manifest) return { ok: false, error: `manifest missing or malformed: ${manifestFile}` };
   if (!manifest.capture?.ok) {

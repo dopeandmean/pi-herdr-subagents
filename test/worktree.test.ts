@@ -7,15 +7,11 @@ import { dirname, join } from "node:path";
 import {
   allocateWorktree,
   captureHandoff,
-  checkSourceClean,
   inspectLane,
   listLanes,
-  manifestFileFor,
-  readManifest,
   recordLaneEvidence,
   removeLane,
-  resolveRepoRoot,
-  type HandoffManifest,
+  type LaneEntry,
 } from "../pi-extension/subagents/worktree.ts";
 
 function git(args: string[], cwd: string): string {
@@ -39,7 +35,7 @@ function makeRepo(path: string): void {
   git(["commit", "-q", "-m", "base"], path);
 }
 
-function lane(id: string, label = "worker"): HandoffManifest {
+function lane(id: string, label = "worker"): LaneEntry {
   const allocation = allocateWorktree({ cwd: repo, label, laneId: id });
   return captureHandoff({
     allocation,
@@ -48,6 +44,12 @@ function lane(id: string, label = "worker"): HandoffManifest {
     name: label,
     terminalState: { status: "completed", exitCode: 0 },
   });
+}
+
+function laneEntry(id: string): LaneEntry {
+  const entry = listLanes(artifactDir, id)[0];
+  assert.ok(entry, `expected lane ${id} to be recorded`);
+  return entry;
 }
 
 before(() => {
@@ -67,9 +69,7 @@ after(() => {
 });
 
 describe("worktree preflight", () => {
-  it("resolves the repository root and rejects non-git cwd", () => {
-    assert.equal(resolveRepoRoot(repo), repo);
-    assert.equal(resolveRepoRoot(tmpdir()), null);
+  it("refuses a cwd that is not a Git repository", () => {
     assert.throws(
       () => allocateWorktree({ cwd: tmpdir(), label: "worker", laneId: "nongit" }),
       /requires a Git repository/,
@@ -82,7 +82,6 @@ describe("worktree preflight", () => {
     const before = readFileSync(join(repo, "app.txt"), "utf8");
     const statusBefore = git(["status", "--porcelain"], repo);
 
-    assert.equal(checkSourceClean(repo).ok, false);
     assert.throws(
       () => allocateWorktree({ cwd: repo, label: "worker", laneId: "dirty1" }),
       /refused: source checkout is not clean/,
@@ -90,9 +89,10 @@ describe("worktree preflight", () => {
     assert.equal(readFileSync(join(repo, "app.txt"), "utf8"), before);
     assert.equal(git(["status", "--porcelain"], repo), statusBefore);
 
+    // Once the user's work is dealt with, isolation is possible again.
     git(["checkout", "--", "app.txt"], repo);
     rmSync(join(repo, "untracked.txt"));
-    assert.equal(checkSourceClean(repo).ok, true);
+    assert.equal(allocateWorktree({ cwd: repo, label: "worker", laneId: "clean001" }).branch, "pi-subagents/worker-clean001");
   });
 
   it("treats cwd-local runtime metadata as noise, not user work", () => {
@@ -103,27 +103,25 @@ describe("worktree preflight", () => {
       mkdirSync(join(noisy, ".pi-lens-probe-home"), { recursive: true });
       writeFileSync(join(noisy, ".pi-lens-probe-home", "extension.log"), "probe output\n");
       // The source gate ignores runtime noise, so isolation is still possible.
-      assert.equal(checkSourceClean(noisy).ok, true);
-
       const allocation = allocateWorktree({ cwd: noisy, label: "worker", laneId });
       mkdirSync(join(allocation.path, ".pi-lens-probe-home"), { recursive: true });
       writeFileSync(join(allocation.path, ".pi-lens-probe-home", "bus-events.log"), "noise\n");
       writeFileSync(join(allocation.path, "real-work.txt"), "work\n");
 
-      const manifest = captureHandoff({
+      const entry = captureHandoff({
         allocation,
         laneId,
         artifactDir,
         name: "worker",
         terminalState: { status: "completed", exitCode: 0 },
       });
-      assert.deepEqual(manifest.changedPaths.map((change) => change.path), ["real-work.txt"]);
-      assert.deepEqual(manifest.excludedRuntimePaths, [".pi-lens-probe-home/bus-events.log"]);
-      assert.doesNotMatch(readFileSync(manifest.patchFile, "utf8"), /pi-lens-probe-home/);
+      assert.deepEqual(entry.manifest.changedPaths.map((change) => change.path), ["real-work.txt"]);
+      assert.deepEqual(entry.manifest.excludedRuntimePaths, [".pi-lens-probe-home/bus-events.log"]);
+      assert.doesNotMatch(readFileSync(entry.manifest.patchFile, "utf8"), /pi-lens-probe-home/);
 
       // Noise left behind by tooling must not block cleanup either.
       rmSync(join(allocation.path, "real-work.txt"), { force: true });
-      const removed = removeLane(manifestFileFor(artifactDir, laneId));
+      const removed = removeLane(entry);
       assert.equal(removed.removed, true, removed.reason);
     } finally {
       rmSync(noisy, { recursive: true, force: true });
@@ -173,7 +171,7 @@ describe("handoff capture", () => {
     writeFileSync(join(allocation.path, "blob.bin"), Buffer.from([0, 1, 2, 255, 0, 7]));
     const statusBefore = git(["status", "--porcelain"], allocation.path);
 
-    const manifest = captureHandoff({
+    const { manifest } = captureHandoff({
       allocation,
       laneId: id,
       artifactDir,
@@ -208,7 +206,7 @@ describe("handoff capture", () => {
     git(["add", "-A"], allocation.path);
     git(["commit", "-q", "-m", "child work"], allocation.path);
 
-    const manifest = captureHandoff({
+    const { manifest } = captureHandoff({
       allocation,
       laneId: id,
       artifactDir,
@@ -224,7 +222,7 @@ describe("handoff capture", () => {
   it("records a failed capture instead of throwing", () => {
     const id = "cap00003";
     const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
-    const manifest = captureHandoff({
+    const entry = captureHandoff({
       allocation: { ...allocation, path: join(sandbox, "missing-worktree") },
       laneId: id,
       artifactDir,
@@ -232,9 +230,9 @@ describe("handoff capture", () => {
       terminalState: { status: "failed", exitCode: 1 },
     });
 
-    assert.equal(manifest.capture.ok, false);
-    assert.equal(manifest.cleanup.status, "preserved");
-    const inspection = inspectLane(manifest, manifestFileFor(artifactDir, id));
+    assert.equal(entry.manifest.capture.ok, false);
+    assert.equal(entry.manifest.cleanup.status, "preserved");
+    const inspection = inspectLane(entry);
     assert.equal(inspection.removable, false);
     assert.match(inspection.blockers.join(" "), /capture failed/);
   });
@@ -247,68 +245,64 @@ describe("cleanup and evidence", () => {
   });
 
   it("removes a clean, captured lane and its branch", () => {
-    const manifest = lane(id);
-    const manifestFile = manifestFileFor(artifactDir, id);
-    assert.equal(manifest.changedPaths.length, 0);
+    const entry = lane(id);
+    assert.equal(entry.manifest.changedPaths.length, 0);
 
-    const result = removeLane(manifestFile, { by: "test" });
+    const result = removeLane(entry, { by: "test" });
     assert.equal(result.removed, true, result.reason);
-    assert.equal(existsSync(manifest.worktree), false);
+    assert.equal(existsSync(entry.manifest.worktree), false);
     assert.equal(
-      execFileSync("git", ["branch", "--list", manifest.branch], { cwd: repo, encoding: "utf8" }).trim(),
+      execFileSync("git", ["branch", "--list", entry.manifest.branch], { cwd: repo, encoding: "utf8" }).trim(),
       "",
     );
-    assert.equal(readManifest(manifestFile)?.cleanup.status, "removed");
+    assert.equal(laneEntry(id).manifest.cleanup.status, "removed");
   });
 
   it("preserves a dirty lane", () => {
-    const manifest = lane(id);
-    const manifestFile = manifestFileFor(artifactDir, id);
-    writeFileSync(join(manifest.worktree, "manual.txt"), "left behind\n");
+    const entry = lane(id);
+    writeFileSync(join(entry.manifest.worktree, "manual.txt"), "left behind\n");
 
-    const result = removeLane(manifestFile, { by: "test" });
+    const result = removeLane(entry, { by: "test" });
     assert.equal(result.removed, false);
     assert.match(result.reason ?? "", /dirty/);
-    assert.equal(existsSync(manifest.worktree), true);
-    assert.equal(readManifest(manifestFile)?.cleanup.status, "pending");
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(laneEntry(id).manifest.cleanup.status, "pending");
   });
 
   it("preserves a lane whose head moved after capture", () => {
-    const manifest = lane(id);
-    writeFileSync(join(manifest.worktree, "later.txt"), "after capture\n");
-    git(["add", "-A"], manifest.worktree);
-    git(["commit", "-q", "-m", "after capture"], manifest.worktree);
+    const entry = lane(id);
+    writeFileSync(join(entry.manifest.worktree, "later.txt"), "after capture\n");
+    git(["add", "-A"], entry.manifest.worktree);
+    git(["commit", "-q", "-m", "after capture"], entry.manifest.worktree);
 
-    const inspection = inspectLane(manifest, manifestFileFor(artifactDir, id));
+    const inspection = inspectLane(laneEntry(id));
     assert.equal(inspection.removable, false);
     assert.match(inspection.blockers.join(" "), /head moved since capture/);
   });
 
   it("preserves a lane with a malformed manifest and reports it in status", () => {
-    const manifest = lane(id);
-    const manifestFile = manifestFileFor(artifactDir, id);
-    writeFileSync(manifestFile, "{ not json");
+    const entry = lane(id);
+    writeFileSync(entry.manifestFile, "{ not json");
 
-    const result = removeLane(manifestFile);
+    const result = removeLane(entry);
     assert.equal(result.removed, false);
     assert.match(result.reason ?? "", /malformed/);
-    assert.equal(existsSync(manifest.worktree), true);
-    assert.equal(listLanes(artifactDir).some((entry) => entry.manifest.laneId === id), false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(listLanes(artifactDir).some((lane) => lane.manifest.laneId === id), false);
   });
 
   it("ties review and merge evidence to the captured head", () => {
-    const manifest = lane(id);
-    const manifestFile = manifestFileFor(artifactDir, id);
+    const entry = lane(id);
 
-    const blocked = recordLaneEvidence(manifestFile, {
+    const blocked = recordLaneEvidence(entry, {
       review: { verdict: "BLOCK", reviewer: "reviewer", notes: "unsafe retry loop" },
     });
     assert.equal(blocked.ok, true);
-    const reviewed = readManifest(manifestFile) as HandoffManifest;
+    const reviewed = laneEntry(id).manifest;
     assert.equal(reviewed.review?.verdict, "BLOCK");
-    assert.equal(reviewed.review?.headCommit, manifest.headCommit);
+    assert.equal(reviewed.review?.headCommit, entry.manifest.headCommit);
 
-    const bogus = recordLaneEvidence(manifestFile, {
+    const bogus = recordLaneEvidence(entry, {
       merge: { commit: "cafe1234", attestor: "parent" },
     });
     assert.equal(bogus.ok, false);
@@ -316,12 +310,12 @@ describe("cleanup and evidence", () => {
 
     git(["commit", "-q", "--allow-empty", "-m", "merge lane"], repo);
     const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
-    const merged = recordLaneEvidence(manifestFile, {
+    const merged = recordLaneEvidence(entry, {
       merge: { commit: mergeCommit, attestor: "parent", postMergeChecks: "npm test" },
     });
     assert.equal(merged.ok, true);
 
-    const final = readManifest(manifestFile) as HandoffManifest;
+    const final = laneEntry(id).manifest;
     assert.equal(final.merge?.commit, mergeCommit);
     assert.equal(final.merge?.reviewedHead, final.review?.headCommit);
     assert.equal(final.merge?.reviewedHead, final.headCommit);
@@ -342,8 +336,8 @@ describe("cleanup and evidence", () => {
       name: "worker",
       terminalState: { status: "failed", exitCode: 1 },
     });
-    assert.equal(failed.capture.ok, false);
-    const result = recordLaneEvidence(manifestFileFor(artifactDir, failedId), {
+    assert.equal(failed.manifest.capture.ok, false);
+    const result = recordLaneEvidence(laneEntry(failedId), {
       review: { verdict: "OK", reviewer: "reviewer" },
     });
     assert.equal(result.ok, false);
