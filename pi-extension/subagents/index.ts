@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import {
   buildAvailableAgentCatalog,
@@ -35,6 +37,9 @@ import {
 } from "./run.ts";
 import { buildAuthenticatedModelCatalog, wrapPiModelRegistry } from "./runtime-routing.ts";
 import { registerSubagentTools } from "./tools/index.ts";
+
+/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
+const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 const modelConfig = loadModelConfig();
 

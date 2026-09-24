@@ -33,7 +33,7 @@ npm run lint
 Run the real end-to-end suite from inside herdr with an explicit test model:
 
 ```bash
-PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+PI_TEST_MODEL="deepseek/deepseek-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
 ```
 
 The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.

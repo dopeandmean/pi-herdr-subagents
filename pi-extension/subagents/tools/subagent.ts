@@ -1,4 +1,4 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { routingGuidelines } from "../guidelines.ts";
 import { isTerminalAvailable } from "../herdr.ts";
 import { SubagentParams } from "../params.ts";
@@ -13,7 +13,8 @@ const DOC =
   "DO NOT fabricate, assume, or summarize results after calling this tool. " +
   "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.";
 
-export const tool: ToolDefinition<typeof SubagentParams> = {
+export function createTool(pi: ExtensionAPI): ToolDefinition<typeof SubagentParams> {
+  return {
   name: "subagent",
   label: "Subagent",
   description: DOC,
@@ -181,4 +182,5 @@ export const tool: ToolDefinition<typeof SubagentParams> = {
     const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
     return new Text(theme.fg("dim", text), 0, 0);
   },
-};
+  };
+}

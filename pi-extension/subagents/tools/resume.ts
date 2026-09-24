@@ -1,4 +1,4 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
@@ -40,7 +40,8 @@ const ResumeParams = Type.Object({
 /** Absolute path to `pi-extension/subagents`. */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url)).replace(/\/tools$/, "");
 
-export const tool: ToolDefinition<typeof ResumeParams> = {
+export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams> {
+  return {
   name: "subagent_resume",
   label: "Resume Subagent",
   description: DOC,
@@ -214,4 +215,5 @@ export const tool: ToolDefinition<typeof ResumeParams> = {
       },
     };
   },
-};
+  };
+}
