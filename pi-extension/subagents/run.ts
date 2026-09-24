@@ -1,4 +1,3 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { dirname, join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { terminalSetupHint, createSubagentPane, runScriptInPane, closePane, interruptPane, shellQuote, readPane, readPaneAsync, inspectPane, setPaneTask } from "./herdr.ts";
@@ -14,7 +13,7 @@ import { capStatusLines, formatElapsedDuration, formatStatusAggregate, normalize
 import { allocateWorktree, captureHandoff, removeLane, type LaneEntry, type WorktreeAllocation } from "./worktree.ts";
 import { getSubagentActivityFile, readSubagentActivityFile, type ActivityReadResult, type SubagentActivityState } from "./activity.ts";
 import { createLifecycle, formatLifecycleTransitionLine, lifecycleTransition, markCompleted, markCompletionDetected, markDelivery, markFailed, markInterruptRequested, markProcessRunning, observeActivity, observePaneInspection, projectLifecycle, type LifecycleProjection, type SubagentLifecycle, type PaneInspection } from "./lifecycle.ts";
-
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 /**
  * The run pipeline: launching a subagent into its own pane, observing it, and
  * delivering its result to the parent session exactly once.
