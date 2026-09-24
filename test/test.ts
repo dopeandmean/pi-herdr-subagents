@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { borderLine, renderSubagentWidgetLines } from "../pi-extension/subagents/widget.ts";
 import {
   cleanupSubagentsForShutdown,
   selectCompletionApi,
@@ -2579,11 +2580,10 @@ describe("subagent startup delay", () => {
 });
 describe("subagents widget rendering", () => {
   it("projects Claude agents as running and counts them as active", () => {
-    const testApi = (subagentsModule as any).__test__;
     const originalNow = Date.now;
     Date.now = () => 30_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([{
+      const lines = renderSubagentWidgetLines([{
         id: "c1",
         name: "Claude",
         task: "",
@@ -2604,7 +2604,6 @@ describe("subagents widget rendering", () => {
   });
 
   it("shows interrupted agents as open while process runtime continues", () => {
-    const testApi = (subagentsModule as any).__test__;
     const interruptedAt = 20_000;
     const lifecycle = markInterruptRequested(
       { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
@@ -2614,7 +2613,7 @@ describe("subagents widget rendering", () => {
     const originalNow = Date.now;
     Date.now = () => 30_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([{
+      const lines = renderSubagentWidgetLines([{
         id: "a1",
         name: "Worker",
         task: "",
@@ -2636,14 +2635,13 @@ describe("subagents widget rendering", () => {
   });
 
   it("freezes runtime when the subagent reports done", () => {
-    const testApi = (subagentsModule as any).__test__;
     const doneAt = 20_000;
     const lifecycle = markCompletionDetected(createLifecycle(5_000), { reason: "done", exitCode: 0 }, doneAt);
 
     const originalNow = Date.now;
     Date.now = () => 30_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([{
+      const lines = renderSubagentWidgetLines([{
         id: "a1",
         name: "Reviewer",
         task: "",
@@ -2664,7 +2662,6 @@ describe("subagents widget rendering", () => {
   });
 
   it("keeps a blue border and summarizes mixed active and open agents", () => {
-    const testApi = (subagentsModule as any).__test__;
     const now = 30_000;
     const active = observeLifecycleActivity(
       createLifecycle(5_000),
@@ -2696,7 +2693,7 @@ describe("subagents widget rendering", () => {
     const originalNow = Date.now;
     Date.now = () => now;
     try {
-      const lines = testApi.renderSubagentWidgetLines([
+      const lines = renderSubagentWidgetLines([
         { id: "a1", name: "Active", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", lifecycle: active, interactive: false },
         { id: "a2", name: "Open", task: "", surface: "s2", startTime: 10_000, sessionFile: "s2", lifecycle: interrupted, interactive: false },
       ], 72);
@@ -2709,14 +2706,10 @@ describe("subagents widget rendering", () => {
   });
 
   it("keeps every rendered line within a very narrow width", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
-
     const originalNow = Date.now;
     Date.now = () => 1_000_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([
+      const lines = renderSubagentWidgetLines([
         {
           id: "a1",
           name: "A",
@@ -2756,23 +2749,15 @@ describe("subagents widget rendering", () => {
   });
 
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.borderLine, "function");
-
-    const line = testApi.borderLine(" A ", " 999 msgs (999.9KB) ", 16);
+    const line = borderLine(" A ", " 999 msgs (999.9KB) ", 16);
     assert.equal(visibleWidth(line), 16);
   });
 
   it("handles ultra-narrow widths without exceeding the width contract", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
-
     const widths = [0, 1, 2];
     for (const width of widths) {
       const startTime = Date.now() - 5_000;
-      const lines = testApi.renderSubagentWidgetLines([
+      const lines = renderSubagentWidgetLines([
         {
           id: "a1",
           name: "A",
