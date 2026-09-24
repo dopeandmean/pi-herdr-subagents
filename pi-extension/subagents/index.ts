@@ -202,37 +202,10 @@ const SubagentParams = Type.Object({
   ),
 });
 
-type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-interface AgentDefaults {
-  model?: string;
-  tools?: string;
-  skills?: string;
-  thinking?: string;
-  denyTools?: string;
-  spawning?: boolean;
-  autoExit?: boolean;
-  interactive?: boolean;
-  systemPromptMode?: "append" | "replace";
-  sessionMode?: SubagentSessionMode;
-  cwd?: string;
-  cli?: string;
-  commandTemplate?: string;
-  body?: string;
-  disableModelInvocation?: boolean;
-}
-
-type AgentSource = "package" | "global" | "project";
-
-interface AgentDefinition extends AgentDefaults {
-  name: string;
-  description?: string;
-  disableModelInvocation: boolean;
-}
-
-interface ListedAgentDefinition extends AgentDefinition {
-  source: AgentSource;
-}
+import {
+  type AgentDefinition,
+  type DiscoveredAgent,
+} from "./agent-definition.ts";
 
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
@@ -247,7 +220,7 @@ const SPAWNING_TOOLS = new Set([
  * `spawning: false` expands to all SPAWNING_TOOLS.
  * `deny-tools` adds individual tool names on top.
  */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
+function resolveDenyTools(agentDefs: AgentDefinition | null): Set<string> {
   const denied = new Set<string>();
   if (!agentDefs) return denied;
 
@@ -339,8 +312,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
+function discoverAgentDefinitions(): DiscoveredAgent[] {
+  const agents = new Map<string, DiscoveredAgent>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
@@ -368,7 +341,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 }
 
 function buildAvailableAgentCatalog(
-  agents: ListedAgentDefinition[],
+  agents: DiscoveredAgent[],
   limit = 24,
   config: ModelConfig = modelConfig,
 ): string {
@@ -399,7 +372,7 @@ function buildAvailableAgentCatalog(
 
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  agentDefs: AgentDefinition | null,
 ): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
@@ -426,7 +399,7 @@ function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
 
 function resolveEffectiveSessionMode(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  agentDefs: AgentDefinition | null,
 ): SubagentSessionMode {
   if (params.fork) return "fork";
   return agentDefs?.sessionMode ?? "standalone";
@@ -434,7 +407,7 @@ function resolveEffectiveSessionMode(
 
 function resolveLaunchBehavior(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  agentDefs: AgentDefinition | null,
 ): {
   sessionMode: SubagentSessionMode;
   seededSessionMode: "lineage-only" | "fork" | null;
@@ -469,7 +442,7 @@ function resolveLaunchBehavior(
  */
 function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  agentDefs: AgentDefinition | null,
 ): boolean {
   // Named agents preserve their declared behavior. Bare tool calls are
   // autonomous by default, including full-context forks: `fork` controls
@@ -481,14 +454,14 @@ function resolveEffectiveAutoExit(
 
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
+  agentDefs: AgentDefinition | null,
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string): DiscoveredAgent | null {
   // Resolve through the same name-keyed map discoverAgentDefinitions() builds
   // for the tool-guidance catalog, so a name advertised there always resolves
   // to the same definition here — even when an agent's frontmatter `name`

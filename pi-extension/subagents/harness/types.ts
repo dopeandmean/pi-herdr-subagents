@@ -1,3 +1,4 @@
+import type { AgentDefinition } from "../agent-definition.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
 
@@ -14,21 +15,7 @@ export interface SubagentLaunchParams {
   interactive?: boolean;
 }
 
-export interface AgentDefinition {
-  name: string;
-  description?: string;
-  model?: string;
-  thinking?: string;
-  tools?: string;
-  skills?: string;
-  sessionMode?: string;
-  systemPromptMode?: string;
-  interactive?: boolean;
-  cli?: string;
-  commandTemplate?: string;
-  body?: string;
-  disableModelInvocation?: boolean;
-}
+export type { AgentDefinition } from "../agent-definition.ts";
 
 export interface SubagentLaunchContext {
   params: SubagentLaunchParams;
