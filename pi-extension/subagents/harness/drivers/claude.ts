@@ -9,6 +9,7 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { SENTINEL_TRAILER } from "../../handoff.ts";
 
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -37,7 +38,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
 
-  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
+  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">): string {
     return runtimePlan.modelId;
   }
 
@@ -89,7 +90,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
     cmdParts.push(shellQuote(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}${SENTINEL_TRAILER}`;
 
     return {
       command,

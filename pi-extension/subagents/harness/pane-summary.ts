@@ -1,10 +1,9 @@
 import type { SubagentResultContext } from "./types.ts";
+import { stripSentinel } from "../handoff.ts";
 
 export function extractPaneSummary(context: SubagentResultContext, displayName: string): string {
   const { completionResult, surface, readPane } = context;
-  const summary = readPane(surface, 200)
-    .replace(/__SUBAGENT_DONE_\d+__/, "")
-    .trimEnd();
+  const summary = stripSentinel(readPane(surface, 200));
 
   if (summary) return summary;
 

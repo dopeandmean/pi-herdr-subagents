@@ -7,6 +7,7 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { SENTINEL_TRAILER } from "../../handoff.ts";
 
 export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly id = "opencode";
@@ -14,7 +15,7 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
 
-  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
+  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">): string {
     return runtimePlan.model;
   }
 
@@ -54,7 +55,7 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
     cmdParts.push(shellQuote(fullTask));
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}${SENTINEL_TRAILER}`;
 
     return {
       command,

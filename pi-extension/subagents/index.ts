@@ -26,6 +26,7 @@ import {
   setPaneTask,
 } from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
+import { SENTINEL_TRAILER } from "./handoff.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -2323,7 +2324,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeEnvPrefix}${parts.join(" ")}${SENTINEL_TRAILER}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

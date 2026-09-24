@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { SENTINEL_PATTERN, consumeCompletionSidecar } from "./handoff.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
-const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 
 export interface CompletionResult {
   reason: "done" | "ping" | "sentinel" | "error";
@@ -62,23 +62,12 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
 }
 
 function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
-  if (!sessionFile) return null;
-
-  const exitFile = `${sessionFile}.exit`;
-  if (!existsSync(exitFile)) return null;
-
-  try {
-    const result = interpretExitSidecar(JSON.parse(readFileSync(exitFile, "utf8")));
-    rmSync(exitFile, { force: true });
-    return result;
-  } catch {
-    // The child may still be writing the file. Retry on the next polling cycle.
-    return null;
-  }
+  const payload = consumeCompletionSidecar(sessionFile);
+  return payload ? interpretExitSidecar(payload) : null;
 }
 
 function terminalExitCode(screen: string): number | null {
-  const match = screen.match(TERMINAL_SENTINEL);
+  const match = screen.match(SENTINEL_PATTERN);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 

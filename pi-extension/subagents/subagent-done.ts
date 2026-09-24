@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { writeCompletionSidecar, type CompletionSidecar } from "./handoff.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -68,9 +69,7 @@ export function findLatestAssistantError(
   return null;
 }
 
-export function buildCompletionSidecar(messages: any[] | undefined):
-  | { type: "done" }
-  | { type: "error"; errorMessage: string; stopReason: "error" } {
+export function buildCompletionSidecar(messages: any[] | undefined): CompletionSidecar {
   const errorInfo = findLatestAssistantError(messages);
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
@@ -198,10 +197,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
-          );
+          writeCompletionSidecar(sessionFile, buildCompletionSidecar(latestAgentMessages));
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
           // after shutdown if the completion sidecar cannot be written.
@@ -293,12 +289,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       recorder.callerPing();
-      const exitData = {
-        type: "ping" as const,
+      writeCompletionSidecar(sessionFile, {
+        type: "ping",
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
-      };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      });
 
       ctx.shutdown();
       return {
@@ -320,7 +315,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeCompletionSidecar(sessionFile, { type: "done" });
       }
       ctx.shutdown();
       return {

@@ -6,6 +6,7 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { SENTINEL_TRAILER } from "../../handoff.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -51,7 +52,7 @@ export class PiHarnessDriver implements HarnessDriver {
   readonly hasActivitySnapshots = true;
   readonly supportsTurnInterrupt = true;
 
-  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
+  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">): string {
     return runtimePlan.model;
   }
 
@@ -171,7 +172,7 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const envPrefix = envParts.length > 0 ? `${envParts.join(" ")} ` : "";
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${envPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${envPrefix}${parts.join(" ")}${SENTINEL_TRAILER}`;
 
     return {
       command,
