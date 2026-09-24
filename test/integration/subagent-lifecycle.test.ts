@@ -20,8 +20,6 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import {
   getAvailableBackends,
-  setBackend,
-  restoreBackend,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
@@ -36,26 +34,23 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const herdrAvailable = getAvailableBackends().length > 0;
 
-if (backends.length === 0) {
+if (!herdrAvailable) {
   console.log("⚠️  herdr is unavailable — skipping subagent lifecycle integration tests");
   console.log("   Run inside herdr to enable these tests.");
 }
 
-for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
-    let prevMux: string | undefined;
+if (herdrAvailable) {
+  describe(`subagent-lifecycle`, { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
 
     before(() => {
-      prevMux = setBackend(backend);
-      env = createTestEnv(backend);
+      env = createTestEnv();
     });
 
     after(() => {
       cleanupTestEnv(env);
-      restoreBackend(prevMux);
     });
 
     // ── Basic spawn + completion ──

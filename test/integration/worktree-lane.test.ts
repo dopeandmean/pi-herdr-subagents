@@ -15,8 +15,6 @@ import { dirname, basename, join } from "node:path";
 import { homedir } from "node:os";
 import {
   getAvailableBackends,
-  setBackend,
-  restoreBackend,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
@@ -29,9 +27,9 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const herdrAvailable = getAvailableBackends().length > 0;
 
-if (backends.length === 0) {
+if (!herdrAvailable) {
   console.log("⚠️  herdr is unavailable — skipping worktree lane integration tests");
   console.log("   Run inside herdr to enable these tests.");
 }
@@ -100,14 +98,12 @@ async function waitForLaneEvidence(
   throw new Error(`Timeout (${timeout}ms) waiting for lane evidence for ${branch}`);
 }
 
-for (const backend of backends) {
-  describe(`worktree-lane [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
-    let prevMux: string | undefined;
+if (herdrAvailable) {
+  describe(`worktree-lane`, { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
 
     before(() => {
-      prevMux = setBackend(backend);
-      env = createTestEnv(backend);
+      env = createTestEnv();
       git(["init", "-q", "-b", "main"], env.dir);
       git(["config", "user.email", "test@example.com"], env.dir);
       git(["config", "user.name", "Test"], env.dir);
@@ -121,14 +117,17 @@ for (const backend of backends) {
       for (const worktree of laneWorktrees(env.dir)) {
         try {
           rmSync(worktree, { recursive: true, force: true });
-        } catch {}
+        } catch {
+          // Already removed by the lane cleanup under test.
+        }
       }
       try {
         git(["worktree", "prune"], env.dir);
         rmSync(join(dirname(env.dir), "worktrees", basename(env.dir)), { recursive: true, force: true });
-      } catch {}
+      } catch {
+        // Worktree bookkeeping cleanup is best effort.
+      }
       cleanupTestEnv(env);
-      restoreBackend(prevMux);
     });
 
     it("runs the child in its own worktree and captures the handoff", async () => {

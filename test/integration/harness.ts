@@ -32,11 +32,9 @@ import {
   closePane,
   interruptPane,
   shellQuote,
-} from "../../pi-extension/subagents/terminal.ts";
+} from "../../pi-extension/subagents/herdr.ts";
 
-type MuxBackend = "herdr";
-
-// Re-export mux primitives for tests
+// Re-export pane primitives for tests
 export {
   createSubagentPane,
   runInPane,
@@ -47,7 +45,6 @@ export {
   interruptPane,
   shellQuote,
 };
-export type { MuxBackend };
 
 // ── Paths ──
 
@@ -79,25 +76,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /** Detect whether the required herdr backend is available. */
-export function getAvailableBackends(): MuxBackend[] {
+export function getAvailableBackends(): string[] {
   return isTerminalAvailable() ? ["herdr"] : [];
 }
 
-export function setBackend(_backend: MuxBackend): undefined {
-  return undefined;
-}
-
-export function restoreBackend(_prev: string | undefined): void {}
-
-export function focusSurface(_backend: MuxBackend, surface: string): void {
-  // Focus the tab containing the pane — herdr has no direct "focus pane X"
-  // CLI, but focusing the tab brings it to the foreground.
-  const info = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
-  const tabId = JSON.parse(info)?.result?.pane?.tab_id;
-  if (tabId) execFileSync("herdr", ["tab", "focus", tabId], { encoding: "utf8" });
-}
-
-export function getFocusedSurface(_backend: MuxBackend): string | null {
+export function getFocusedSurface(): string | null {
   try {
     const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
     return JSON.parse(info)?.result?.pane?.pane_id ?? null;
@@ -106,34 +89,11 @@ export function getFocusedSurface(_backend: MuxBackend): string | null {
   }
 }
 
-export function getSurfacePane(_backend: MuxBackend, surface: string): string | null {
-  return surface;
-}
-
-export async function waitForFocusedSurface(
-  backend: MuxBackend,
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    if (getFocusedSurface(backend) === surface) return;
-    await sleep(200);
-  }
-
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for focused ${backend} surface ${surface}; ` +
-      `current focus is ${getFocusedSurface(backend) ?? "unknown"}`,
-  );
-}
-
 // ── Test environment ──
 
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Active mux backend for this test run */
-  backend: MuxBackend;
   /** Dedicated workspace owned by this test environment. */
   workspaceId: string;
   /** Parent workspace restored after cleanup. */
@@ -162,7 +122,7 @@ function createTestWorkspace(cwd: string): string {
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
  */
-export function createTestEnv(backend: MuxBackend): TestEnv {
+export function createTestEnv(): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
   const previousWorkspaceId = process.env.HERDR_WORKSPACE_ID;
@@ -188,7 +148,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     }
   }
 
-  return { dir, backend, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
+  return { dir, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
 }
 
 /**
@@ -200,11 +160,15 @@ export function cleanupTestEnv(env: TestEnv): void {
   for (const surface of env.surfaces) {
     try {
       closePane(surface);
-    } catch {}
+    } catch {
+      // The pane may already be gone; the workspace close below is the backstop.
+    }
   }
   try {
     execFileSync("herdr", ["workspace", "close", env.workspaceId], { encoding: "utf8" });
-  } catch {}
+  } catch {
+    // Best effort: a workspace that is already gone is the success case.
+  }
   if (env.previousWorkspaceId) {
     process.env.HERDR_WORKSPACE_ID = env.previousWorkspaceId;
   } else {
@@ -213,11 +177,15 @@ export function cleanupTestEnv(env: TestEnv): void {
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
-    } catch {}
+    } catch {
+      // Temp file cleanup is best effort.
+    }
   }
   try {
     rmSync(env.dir, { recursive: true, force: true });
-  } catch {}
+  } catch {
+    // Temp dir cleanup is best effort.
+  }
 }
 
 /**
@@ -292,14 +260,18 @@ export async function waitForScreen(
     try {
       const screen = await readPaneAsync(surface, lines);
       if (pattern.test(screen)) return screen;
-    } catch {}
+    } catch {
+      // A pane that is mid-creation may not be readable yet; poll again.
+    }
     await sleep(2000);
   }
 
   let finalScreen = "";
   try {
     finalScreen = readPane(surface, lines);
-  } catch {}
+  } catch {
+    // Reporting the timeout is more useful than the read failure that hid it.
+  }
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
   );

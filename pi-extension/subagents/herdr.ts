@@ -1,7 +1,16 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import type { HerdrAgentStatus, PaneInspection } from "./lifecycle.ts";
 
 const execFileAsync = promisify(execFile);
+
+export type PaneId = string;
+export type { PaneInspection, HerdrAgentStatus };
+
+const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -36,25 +45,32 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-export function isHerdrAvailable(): boolean {
+export function isTerminalAvailable(): boolean {
   return process.env.HERDR_ENV === "1" && hasCommand("herdr");
 }
 
-function parseHerdrJson(value: string): unknown {
+export function terminalSetupHint(): string {
+  return SETUP_HINT;
+}
+
+function assertTerminalAvailable(): void {
+  if (!isTerminalAvailable()) throw new Error(`herdr is not available. ${SETUP_HINT}`);
+}
+
+export function shellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+/** Parsed herdr CLI JSON payload; null when the output was not a JSON object. */
+type HerdrJson = Record<string, unknown> | null;
+
+function parseHerdrJson(value: string): HerdrJson {
   try {
-    return JSON.parse(value);
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
   } catch {
     return null;
   }
-}
-
-function extractHerdrPaneId(output: string, context: string): string {
-  const parsed = parseHerdrJson(output);
-  const paneId = (parsed as { result?: { pane?: { pane_id?: unknown } } })?.result?.pane?.pane_id;
-  if (typeof paneId !== "string" || !paneId) {
-    throw new Error(`Unexpected herdr ${context} output: ${output.trim() || "(empty)"}`);
-  }
-  return paneId;
 }
 
 function extractHerdrRootPaneId(output: string, context: string): string {
@@ -74,14 +90,6 @@ function herdrExec(args: string[]): string {
 async function herdrExecAsync(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
   return stdout;
-}
-
-function getHerdrParentPaneId(): string {
-  const paneId = process.env.HERDR_PANE_ID;
-  if (!paneId) {
-    throw new Error("HERDR_PANE_ID not set");
-  }
-  return paneId;
 }
 
 function getHerdrCurrentPaneInfo(): {
@@ -128,7 +136,9 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
   ];
 }
 
-export function createHerdrSurface(name: string): string {
+/** Create a new herdr tab for one subagent and return its root pane ID. */
+export function createSubagentPane(name: string): PaneId {
+  assertTerminalAvailable();
   // Create a new tab per subagent so parallel spawns each get a full tab
   // instead of ever-narrower splits of the parent pane. Target the current
   // workspace explicitly because Herdr's implicit default may be another space.
@@ -143,48 +153,64 @@ export function createHerdrSurface(name: string): string {
   return paneId;
 }
 
-export function createHerdrSurfaceSplit(
-  name: string,
-  direction: "right" | "down",
-): string {
-  const parentPaneId = getHerdrParentPaneId();
-  const output = herdrExec([
-    "pane",
-    "split",
-    parentPaneId,
-    "--direction",
-    direction,
-    "--no-focus",
-    "--cwd",
-    process.cwd(),
-  ]);
-  const paneId = extractHerdrPaneId(output, "pane split");
-  try {
-    herdrExec(["pane", "rename", paneId, name]);
-  } catch {
-    // Optional.
-  }
-  return paneId;
+export function runInPane(paneId: PaneId, command: string): void {
+  assertTerminalAvailable();
+  // pane run sends the text and Enter in a single socket request, avoiding
+  // a race where Enter could arrive before the text is fully processed.
+  herdrExec(["pane", "run", paneId, command]);
 }
 
-export function readHerdrScreen(surface: string, lines = 50): string {
+export function runScriptInPane(
+  paneId: PaneId,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  const scriptPath =
+    options?.scriptPath ??
+    join(
+      tmpdir(),
+      "pi-herdr-subagent-scripts",
+      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+    );
+  mkdirSync(dirname(scriptPath), { recursive: true });
+
+  const scriptLines = ["#!/bin/bash"];
+  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
+  scriptLines.push(command);
+  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
+
+  runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
+  return scriptPath;
+}
+
+export function interruptPane(paneId: PaneId): void {
+  assertTerminalAvailable();
+  herdrExec(["pane", "send-keys", paneId, "Escape"]);
+}
+
+export function readPane(paneId: PaneId, lines = 50): string {
+  assertTerminalAvailable();
   // `visible` is reliable for freshly created panes where herdr's `recent`
   // scrollback may not be populated yet.
-  return herdrExec(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+  return herdrExec(["pane", "read", paneId, "--source", "visible", "--lines", String(lines)]);
 }
 
-export async function readHerdrScreenAsync(surface: string, lines = 50): Promise<string> {
-  return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
+  assertTerminalAvailable();
+  return herdrExecAsync(["pane", "read", paneId, "--source", "visible", "--lines", String(lines)]);
 }
 
-export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+export function closePane(paneId: PaneId): void {
+  assertTerminalAvailable();
+  herdrExec(["pane", "close", paneId]);
+}
 
-type PaneInspectionResult =
-  | { kind: "present"; agent?: string; agentStatus: "idle" | "working" | "blocked" | "done" | "unknown" }
+type PaneQueryResult =
+  | { kind: "present"; agent?: string; agentStatus: HerdrAgentStatus }
   | { kind: "missing"; error?: string }
   | { kind: "unavailable"; error: string };
 
-function parsePaneGetOutput(output: string, surface: string): PaneInspectionResult {
+function parsePaneGetOutput(output: string, paneId: string): PaneQueryResult {
   const parsed = parseHerdrJson(output) as
     | { result?: { pane?: unknown }; error?: { code?: unknown; message?: unknown } }
     | null;
@@ -195,7 +221,7 @@ function parsePaneGetOutput(output: string, surface: string): PaneInspectionResu
   const pane = parsed?.result?.pane;
   if (!pane || typeof pane !== "object") return { kind: "unavailable", error: "pane get returned no pane record" };
   const record = pane as { pane_id?: unknown; agent?: unknown; agent_status?: unknown };
-  if (record.pane_id !== surface) return { kind: "unavailable", error: "pane id mismatch" };
+  if (record.pane_id !== paneId) return { kind: "unavailable", error: "pane id mismatch" };
   const agent = typeof record.agent === "string" ? record.agent : undefined;
   const rawStatus = typeof record.agent_status === "string" ? record.agent_status : "unknown";
   const agentStatus = rawStatus === "idle" ||
@@ -208,7 +234,7 @@ function parsePaneGetOutput(output: string, surface: string): PaneInspectionResu
   return { kind: "present", ...(agent ? { agent } : {}), agentStatus };
 }
 
-function parsePaneGetError(error: any): PaneInspectionResult {
+function parsePaneGetError(error: any): PaneQueryResult {
   for (const raw of [error?.stderr, error?.stdout]) {
     if (typeof raw !== "string" || !raw.trim()) continue;
     try {
@@ -235,36 +261,18 @@ function parsePaneGetError(error: any): PaneInspectionResult {
  * - missing: server responded, pane is gone
  * - unavailable: server command failed; caller should keep polling
  */
-export async function inspectHerdrPane(surface: string): Promise<PaneInspectionResult> {
+export async function inspectPane(paneId: PaneId): Promise<PaneInspection> {
+  assertTerminalAvailable();
+  let result: PaneQueryResult;
   try {
-    return parsePaneGetOutput(await herdrExecAsync(["pane", "get", surface]), surface);
+    result = parsePaneGetOutput(await herdrExecAsync(["pane", "get", paneId]), paneId);
   } catch (error: any) {
-    return parsePaneGetError(error);
+    result = parsePaneGetError(error);
   }
-}
-
-export function sendHerdrCommand(surface: string, command: string): void {
-  // pane run sends the text and Enter in a single socket request, avoiding
-  // a race where Enter could arrive before the text is fully processed.
-  herdrExec(["pane", "run", surface, command]);
-}
-
-export function sendHerdrEscape(surface: string): void {
-  herdrExec(["pane", "send-keys", surface, "Escape"]);
-}
-
-export function closeHerdrSurface(surface: string): void {
-  herdrExec(["pane", "close", surface]);
-}
-
-export function renameHerdrTab(title: string): void {
-  const { tab_id: tabId } = getHerdrCurrentPaneInfo();
-  herdrExec(["tab", "rename", tabId, title]);
-}
-
-export function renameHerdrWorkspace(title: string): void {
-  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
-  herdrExec(["workspace", "rename", workspaceId, title]);
+  if (result.kind === "present") {
+    return { ...result, observedAt: Date.now() };
+  }
+  return result;
 }
 
 function buildPaneReportTaskArgs(
@@ -284,15 +292,11 @@ function buildPaneReportTaskArgs(
   ];
 }
 
-export function reportHerdrPaneTask(
-  paneId: string,
-  task: string,
-  source = "pi",
-): void {
-  const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
-  if (!normalizedTask) return;
+export function setPaneTask(paneId: PaneId, task: string): void {
+  if (!isTerminalAvailable()) return;
+  if (!task.replace(/[\r\n\t]+/g, " ").trim()) return;
   try {
-    herdrExec(buildPaneReportTaskArgs(paneId, normalizedTask, source));
+    herdrExec(buildPaneReportTaskArgs(paneId, task));
   } catch {
     // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
   }
@@ -302,7 +306,6 @@ export const __herdrTest__ = {
   buildTabCreateArgs,
   buildPaneReportTaskArgs,
   parseHerdrJson,
-  extractHerdrPaneId,
   extractHerdrRootPaneId,
   parsePaneGetOutput,
   parsePaneGetError,

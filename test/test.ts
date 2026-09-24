@@ -24,7 +24,7 @@ import {
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
-import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { isTerminalAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -2795,9 +2795,9 @@ describe("subagents widget rendering", () => {
 });
 
 describe("herdr.ts", () => {
-  describe("isHerdrAvailable", () => {
+  describe("isTerminalAvailable", () => {
     it("returns boolean based on HERDR_ENV", () => {
-      const result = isHerdrAvailable();
+      const result = isTerminalAvailable();
       assert.equal(typeof result, "boolean");
     });
   });
@@ -2853,19 +2853,6 @@ describe("herdr.ts", () => {
   });
 
   describe("herdr response parsing", () => {
-    it("extracts pane id from a pane split response", () => {
-      const output = JSON.stringify({
-        result: {
-          pane: {
-            pane_id: "1-3",
-            tab_id: "1:2",
-            workspace_id: "1",
-          },
-        },
-      });
-      assert.equal(__herdrTest__.extractHerdrPaneId(output, "pane split"), "1-3");
-    });
-
     it("extracts root pane id from a tab create response", () => {
       const output = JSON.stringify({
         result: {
@@ -2878,8 +2865,8 @@ describe("herdr.ts", () => {
 
     it("throws on malformed herdr JSON", () => {
       assert.throws(
-        () => __herdrTest__.extractHerdrPaneId("not json", "pane split"),
-        /Unexpected herdr pane split output/,
+        () => __herdrTest__.extractHerdrRootPaneId("not json", "tab create"),
+        /Unexpected herdr tab create output/,
       );
     });
 

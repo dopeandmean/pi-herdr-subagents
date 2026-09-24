@@ -24,7 +24,7 @@ import {
   readPaneAsync,
   inspectPane,
   setPaneTask,
-} from "./terminal.ts";
+} from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
   buildAuthenticatedModelCatalog,
