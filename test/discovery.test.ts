@@ -160,12 +160,15 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
+  it("bundled role profiles preserve their runtime and interaction defaults", async () => {
     await withIsolatedAgentEnv(() => {
       const expectedInteraction = {
-        scout: false,
-        worker: false,
-        reviewer: false,
+        orchestrator: false,
+        "subagent-explorer": false,
+        "subagent-worker": false,
+        "subagent-reviewer": false,
+        "subagent-tester": false,
+        "subagent-quality": false,
         planner: true,
         "visual-tester": false,
       } as const;
@@ -173,8 +176,15 @@ describe("subagent discovery", () => {
       for (const [name, interactive] of Object.entries(expectedInteraction)) {
         const defs = testApi.loadAgentDefaults(name);
         assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-        assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
-        assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
+        if (name === "planner" || name === "visual-tester") {
+          assert.equal(defs.model, undefined);
+          assert.equal(defs.thinking, undefined);
+        } else {
+          assert.match(defs.model!, /^deepseek\/deepseek-(flash|v4-pro)$/);
+          assert.ok(defs.thinking);
+          assert.equal(defs.sessionMode, "lineage-only");
+          assert.equal(defs.ponytail, name === "orchestrator" || name === "subagent-worker" ? "full" : "off");
+        }
         assert.equal(
           testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
           interactive,
@@ -266,27 +276,6 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
-  });
-
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
-    );
   });
 
   it("lists visible agents from discovery", async () => {

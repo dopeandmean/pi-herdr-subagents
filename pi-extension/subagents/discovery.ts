@@ -98,6 +98,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const frontmatter = match[1];
   const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  const ponytail = getFrontmatterValue(frontmatter, "ponytail");
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
@@ -111,6 +112,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           ? "append"
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
+    ponytail: ponytail === "off" || ponytail === "lite" || ponytail === "full" || ponytail === "ultra" ? ponytail : undefined,
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),

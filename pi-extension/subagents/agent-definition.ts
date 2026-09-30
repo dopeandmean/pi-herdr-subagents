@@ -14,6 +14,7 @@ export interface AgentDefinition {
   model?: string;
   tools?: string;
   skills?: string;
+  ponytail?: "off" | "lite" | "full" | "ultra";
   thinking?: string;
   denyTools?: string;
   spawning?: boolean;

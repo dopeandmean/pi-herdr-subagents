@@ -3,10 +3,12 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { dirname } from "node:path";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { writeCompletionSidecar, type CompletionSidecar } from "./handoff.ts";
 
@@ -81,6 +83,17 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+export function loadAssignedSkills(selection: string, commands: SlashCommandInfo[]): string {
+  if (!selection.trim() || selection.trim() === "none") return "";
+  if (selection.trim() === "all") throw new Error("Assign specific skill names; skills: all is not supported.");
+  return [...new Set(selection.split(",").map((name) => name.trim()).filter(Boolean))].map((name) => {
+    const skill = commands.find((command) => command.source === "skill" && command.name === `skill:${name}`);
+    if (!skill) throw new Error(`Assigned skill not available: ${name}`);
+    const path = skill.sourceInfo.path;
+    return `<skill name="${name}" location="${path}">\nReferences are relative to ${dirname(path)}.\n\n${stripFrontmatter(readFileSync(path, "utf8")).trim()}\n</skill>`;
+  }).join("\n\n");
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -91,6 +104,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const assignedSkills = process.env.PI_SUBAGENT_SKILLS ?? "";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -161,12 +175,21 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event, ctx) => {
     recorder.input();
-    // Ignore the initial task message that starts an autonomous subagent.
-    // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    if (shouldMarkUserTookOver(agentStarted)) userTookOver = true;
+    if (!assignedSkills || assignedSkills.trim() === "none") return;
+    try {
+      const instructions = loadAssignedSkills(assignedSkills, pi.getCommands());
+      return { action: "transform", text: `${instructions}\n\n${event.text}`, images: event.images };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (sessionFile) writeCompletionSidecar(sessionFile, { type: "error", errorMessage, stopReason: "error" });
+      ctx.ui.notify(errorMessage, "error");
+      ctx.shutdown();
+      return { action: "handled" };
+    }
   });
 
   pi.on("before_agent_start", () => {
@@ -242,6 +265,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", (event) => {
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
+    if (parseDeniedTools(deniedToolsValue).includes(event.toolName)) {
+      return { block: true, reason: `Tool denied by this agent definition: ${event.toolName}` };
+    }
   });
 
   pi.on("tool_execution_update", (event) => {

@@ -61,7 +61,7 @@ You are not a dedicated spec agent. You clarify intent and requirements **only e
 
 You have two specialist agents available — use them when a fact (not a preference) is blocking a decision:
 
-- **`scout`** — for codebase facts ("how does auth work today?", "what patterns exist for X?")
+- **`subagent-explorer`** — for codebase facts ("how does auth work today?", "what patterns exist for X?")
 - **`researcher`** — for external knowledge ("current best practices for X", "tradeoffs between library A and B")
 
 Don't delegate for user-preference questions — those you ask the user. Don't delegate when you can answer from existing context. See the **Delegation** section below.
@@ -293,7 +293,7 @@ If a section depends on existing code behavior you haven't verified ("does the e
 ```typescript
 subagent({
   name: "🔍 Scout",
-  agent: "scout",
+  agent: "subagent-explorer",
   task: "Look at [specific file/module/area]. Answer: [specific question]. Report back with file:line references.",
 });
 ```
@@ -483,7 +483,7 @@ Use when a design decision depends on how existing code actually behaves, and yo
 ```typescript
 subagent({
   name: "🔍 Scout",
-  agent: "scout",
+  agent: "subagent-explorer",
   task: "Look at [specific file/module/area]. Answer: [specific question — e.g. 'how are sessions persisted today?']. Report with file:line references.",
 });
 ```

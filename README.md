@@ -16,8 +16,8 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs in its own 
 For parallel execution, just call `subagent` multiple times — they all run concurrently:
 
 ```typescript
-subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
-subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
+subagent({ name: "Scout: Auth", agent: "subagent-explorer", task: "Analyze auth module" });
+subagent({ name: "Scout: DB", agent: "subagent-explorer", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
@@ -91,15 +91,22 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Bundled Agents
 
-| Agent             | Default runtime       | Role                                                                                     |
-| ----------------- | --------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Config, then parent   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent | Default runtime | Role / assigned skills |
+| --- | --- | --- |
+| **orchestrator** | deepseek/deepseek-flash, max | Conditional delegation, review and verification; Ponytail full |
+| **subagent-explorer** | deepseek/deepseek-flash, low | Focused read-only discovery |
+| **subagent-worker** | deepseek/deepseek-flash, max | Scoped implementation and checks; Ponytail full |
+| **subagent-reviewer** | deepseek/deepseek-v4-pro, max | Independent review; code-review, code-quality-checklist |
+| **subagent-tester** | deepseek/deepseek-flash, medium | Verification and failure classification |
+| **subagent-quality** | deepseek/deepseek-v4-pro, max | Optional complexity review; ponytail-review |
+| **planner** | Config, then parent | Interactive planning |
+| **visual-tester** | Config, then parent | Visual QA via Chrome CDP |
 
-Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
+The new subagent names replace bundled scout, worker and reviewer. Update explicit invocations accordingly. The specialist definitions require the named tools/skills to be installed in Pi. Global definitions with matching names override these package defaults. Use exact authenticated model IDs; omit per-call model/thinking to use the role defaults, or explicitly override them.
+
+Normal work uses discovery when needed, worker with checks, then independent reviewer. Add tester or quality only when the change warrants it. For bugs assign `skills: "diagnosing-bugs"` to the worker. For an explicit repository audit assign `skills: "ponytail-audit, codebase-design"` to quality. Architecture improvement is a separate parent-led workflow.
+
+`/subagent orchestrator <task>` runs the coordinator in its own pane. It deliberately uses `auto-exit: false` and `interactive: false`: it must stay alive across turns while its delegated runs finish, then call `subagent_done`. An agent definition does not automatically change the existing parent session's prompt. To use that guidance in the parent, start Pi with `--append-system-prompt <path-to-orchestrator.md>`; this loads prompt text, not frontmatter runtime settings.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
 
@@ -189,15 +196,15 @@ cp config.json.example config.json
 }
 ```
 
-The copyable example is model-neutral, so it works without requiring credentials for a specific provider. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
+The copyable config example is model-neutral; the new bundled role profiles themselves specify DeepSeek models. Remove/override a role's frontmatter model to use the fallback config below. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
 
 ```json
 {
   "models": {
     "default": "your-provider/your-default-model",
     "agents": {
-      "scout": "your-provider/your-fast-model",
-      "reviewer": "your-provider/your-review-model"
+      "subagent-explorer": "your-provider/your-fast-model",
+      "subagent-reviewer": "your-provider/your-review-model"
     }
   }
 }
@@ -213,7 +220,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 ```typescript
 // Named agent with defaults from agent definition or config.json
-subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
+subagent({ name: "Scout", agent: "subagent-explorer", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
@@ -250,8 +257,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 Parallel writers normally share one checkout. With `worktree: true` the child gets its own Git worktree and branch, so two workers cannot see or clobber each other's edits:
 
 ```typescript
-subagent({ name: "Parser", agent: "worker", worktree: true, task: "Rewrite the parser..." });
-subagent({ name: "Tests", agent: "worker", worktree: true, task: "Add parser tests..." });
+subagent({ name: "Parser", agent: "subagent-worker", worktree: true, task: "Rewrite the parser..." });
+subagent({ name: "Tests", agent: "subagent-worker", worktree: true, task: "Add parser tests..." });
 ```
 
 Launch is fail-closed. The extension resolves the repository root for the child's `cwd`, requires a clean source checkout, then creates the lane before any pane exists: a dirty or non-Git checkout rejects the spawn with the repository untouched — nothing is stashed, reset, or silently absorbed into the lane. Each lane gets a unique branch (`pi-subagents/<label>-<id>`) and a worktree outside the checkout at `<parent-of-repo>/worktrees/<repo>/pi-worktree-<id>`; set `PI_SUBAGENTS_WORKTREE_DIR` to relocate that root. Cwd-local runtime metadata written by pi tooling (default `.pi-lens-probe-home`, override with `PI_SUBAGENTS_WORKTREE_EXCLUDE`) is ignored by the clean-tree gate and excluded from capture, so it never reaches a patch.
@@ -388,8 +395,9 @@ You are a specialized agent that does X...
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
 | `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
-| `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
+| `tools`       | string  | Comma-separated registered Pi tools, including built-in and extension tools; replaces the default selection. A shell command such as `jq` is not a tool name                                                                                                                                                                             |
+| `skills`      | string  | Comma-separated skill names loaded with the task in one turn; `none` skips assignments; omitted uses the role default                                                                                                                                                                                                                                    |
+| `ponytail` | string | Pi-only `off`, `lite`, `full`, or `ultra`; requires the installed Ponytail extension; independent of skill assignment |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
@@ -401,6 +409,19 @@ You are a specialized agent that does X...
 ---
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+
+### Assigned skills and Ponytail
+
+```yaml
+skills: code-review, code-quality-checklist
+ponytail: off
+```
+
+Per-call `skills` and `ponytail` override the agent defaults. Skill lists are comma-separated strings, not YAML arrays. Omitted skills inherit the role's assignments. `none` means no assigned skills; it does not disable normal skill discovery or the Ponytail extension. `all` is unsupported: select the relevant skills explicitly.
+
+The subagent resolves assignments from its own enabled Pi skill catalog (including package skills) and receives their full instructions with the task. Missing or unreadable assignments fail the run before task execution. No separate skill-only turns are started. References retain each skill's source directory.
+
+Pi launches save a `.launch.json` beside the session. `subagent_resume` reuses the role prompt, tools, skill assignments, mode defaults and cwd while assigning a fresh run identity. Sessions predating this profile keep the legacy resume behavior. Keep the generated prompt files and launch profile with the session when resuming it.
 
 ### `session-mode`
 
@@ -438,7 +459,7 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 ```yaml
 ---
-name: scout
+name: subagent-explorer
 auto-exit: true
 ---
 ```
@@ -466,7 +487,7 @@ name: planner
 Or per spawn:
 
 ```typescript
-subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
+subagent({ name: "Scout", agent: "subagent-explorer", interactive: true, task: "..." });
 ```
 
 ---

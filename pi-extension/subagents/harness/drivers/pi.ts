@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
   HarnessDriver,
@@ -26,24 +26,31 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
   return [...allow].join(",");
 }
 
-export function buildPiPromptArgs(params: {
-  effectiveSkills?: string;
-  taskDelivery: "direct" | "artifact";
-  taskArg: string;
-}): string[] {
-  const skillPrompts = (params.effectiveSkills ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((skill) => `/skill:${skill}`);
+/** Reusable Pi settings, excluding a run's task and lifecycle identity. */
+export interface PiLaunchProfile {
+  args: string[];
+  env: Record<string, string>;
+  cwd: string | null;
+}
 
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null {
+  const path = `${sessionFile}.launch.json`;
+  if (!existsSync(path)) return null; // Sessions created before launch profiles still resume.
+  const profile = JSON.parse(readFileSync(path, "utf8"));
+  if (!Array.isArray(profile?.args) || profile.args[0] !== "pi" ||
+      !profile.args.every((v: unknown) => typeof v === "string") ||
+      !profile.env || typeof profile.env !== "object" || Array.isArray(profile.env) ||
+      !Object.entries(profile.env).every(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === "string") ||
+      !(profile.cwd === null || typeof profile.cwd === "string")) {
+    throw new Error(`Invalid Pi launch profile: ${path}`);
+  }
+  return profile;
+}
 
-  return [
-    ...(needsSeparator ? [""] : []),
-    ...skillPrompts,
-    params.taskArg,
-  ];
+export function formatPiLaunch(profile: PiLaunchProfile, shellQuote: (value: string) => string): string {
+  const env = Object.entries(profile.env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
+  const args = profile.args.map((arg) => /^(pi|--[a-z-]+|-e)$/.test(arg) ? arg : shellQuote(arg)).join(" ");
+  return `${profile.cwd ? `cd ${shellQuote(profile.cwd)} && ` : ""}${env ? `${env} ` : ""}${args}`;
 }
 
 export class PiHarnessDriver implements HarnessDriver {
@@ -82,16 +89,16 @@ export class PiHarnessDriver implements HarnessDriver {
     } = context;
 
     const parts: string[] = ["pi"];
-    parts.push("--session", shellQuote(subagentSessionFile));
+    parts.push("--session", subagentSessionFile);
 
     const subagentDonePath = join(subagentsDir, "subagent-done.ts");
-    parts.push("-e", shellQuote(subagentDonePath));
+    parts.push("-e", subagentDonePath);
 
     if (effectiveModel) {
-      parts.push("--model", shellQuote(effectiveModel));
+      parts.push("--model", effectiveModel);
     }
     if (effectiveThinking) {
-      parts.push("--thinking", shellQuote(effectiveThinking));
+      parts.push("--thinking", effectiveThinking);
     }
 
     if (identityInSystemPrompt && identity) {
@@ -106,37 +113,40 @@ export class PiHarnessDriver implements HarnessDriver {
       const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
-      parts.push(flag, shellQuote(syspromptPath));
+      parts.push(flag, syspromptPath);
     }
 
     const effectiveTools = params.tools ?? agentDefs?.tools;
     const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
     if (toolAllowlist) {
-      parts.push("--tools", shellQuote(toolAllowlist));
+      parts.push("--tools", toolAllowlist);
     }
 
-    const envParts: string[] = [];
+    const env: Record<string, string> = {};
     if (localAgentDir && existsSync(localAgentDir)) {
-      envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
+      env.PI_CODING_AGENT_DIR = localAgentDir;
     } else if (process.env.PI_CODING_AGENT_DIR) {
-      envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
+      env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
     }
 
-    if (denySet && denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-    }
-    envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
-    if (params.agent) {
-      envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
-    }
-    if (effectiveAutoExit) {
-      envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
-    }
-    envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
-    envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
-    const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
-    envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-    envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
+    // Clear inherited assignments when this role has no assigned skills or denials.
+    env.PI_DENY_TOOLS = [...(denySet ?? [])].join(",");
+    env.PI_SUBAGENT_SKILLS = params.skills ?? agentDefs?.skills ?? "";
+    const ponytail = params.ponytail ?? agentDefs?.ponytail;
+    if (ponytail) env.PONYTAIL_DEFAULT_MODE = ponytail;
+    env.PI_SUBAGENT_AGENT = params.agent ?? "";
+
+    // Preserve the role, tools, skills, mode and cwd on subagent_resume.
+    const profile: PiLaunchProfile = { args: parts, env, cwd: effectiveCwd ?? process.cwd() };
+    mkdirSync(dirname(subagentSessionFile), { recursive: true });
+    writeFileSync(`${subagentSessionFile}.launch.json`, JSON.stringify(profile), "utf8");
+
+    env.PI_SUBAGENT_NAME = params.name;
+    env.PI_SUBAGENT_AUTO_EXIT = effectiveAutoExit ? "1" : "0";
+    env.PI_SUBAGENT_SESSION = subagentSessionFile;
+    env.PI_SUBAGENT_ID = params.id;
+    env.PI_SUBAGENT_ACTIVITY_FILE = join(artifactDir, `subagent-activity-${params.id}.json`);
+    env.PI_SUBAGENT_SURFACE = surface;
 
     const fullTask = taskDelivery === "direct"
       ? params.task
@@ -160,19 +170,10 @@ export class PiHarnessDriver implements HarnessDriver {
       taskArg = `@${artifactPath}`;
     }
 
-    const effectiveSkills = params.skills ?? agentDefs?.skills;
-    const promptArgs = buildPiPromptArgs({
-      effectiveSkills,
-      taskDelivery,
-      taskArg,
-    });
-    for (const promptArg of promptArgs) {
-      parts.push(shellQuote(promptArg));
-    }
+    // One task prompt: skills are expanded by the child using its own skill catalog.
+    parts.push(taskArg);
 
-    const envPrefix = envParts.length > 0 ? `${envParts.join(" ")} ` : "";
-    const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${envPrefix}${parts.join(" ")}${SENTINEL_TRAILER}`;
+    const command = `${formatPiLaunch(profile, shellQuote)}${SENTINEL_TRAILER}`;
 
     return {
       command,

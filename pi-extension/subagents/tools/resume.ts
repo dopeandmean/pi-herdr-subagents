@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
+import { formatPiLaunch, readPiLaunchProfile } from "../harness/drivers/pi.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
 import { createSubagentPane, isTerminalAvailable, runScriptInPane, setPaneTask, shellQuote } from "../herdr.ts";
 import { createLifecycle } from "../lifecycle.ts";
@@ -98,6 +99,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     // Record entry count before resuming so we can extract new messages
     const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
+    const profile = readPiLaunchProfile(params.sessionPath);
     const surface = createSubagentPane(name);
     if (params.message) {
       setPaneTask(surface, params.message);
@@ -105,11 +107,11 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
     // Build pi resume command
-    const parts = ["pi", "--session", shellQuote(params.sessionPath)];
+    const parts = profile ? [...profile.args] : ["pi", "--session", params.sessionPath];
 
     // Load subagent-done extension so the agent can self-terminate if needed
     const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-    parts.push("-e", shellQuote(subagentDonePath));
+    if (!profile) parts.push("-e", subagentDonePath);
 
     const sessionId = ctx.sessionManager.getSessionId();
     const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -131,24 +133,19 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
       );
       mkdirSync(dirname(resumeMsgFile), { recursive: true });
       writeFileSync(resumeMsgFile, params.message, "utf8");
-      parts.push(shellQuote(`@${resumeMsgFile}`));
+      parts.push(`@${resumeMsgFile}`);
     }
 
-    // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-    const resumeEnvParts: string[] = [];
-    if (process.env.PI_CODING_AGENT_DIR) {
-      resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-    }
-    resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-    if (autoExit) {
-      resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-    }
-    const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-
-    const command = `${resumeEnvPrefix}${parts.join(" ")}${SENTINEL_TRAILER}`;
+    // Preserve role settings while assigning this resumed run a fresh identity.
+    const env = profile ? { ...profile.env } : {};
+    if (!profile && process.env.PI_CODING_AGENT_DIR) env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
+    env.PI_SUBAGENT_NAME = name;
+    env.PI_SUBAGENT_SESSION = params.sessionPath;
+    env.PI_SUBAGENT_ID = id;
+    env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+    env.PI_SUBAGENT_SURFACE = surface;
+    env.PI_SUBAGENT_AUTO_EXIT = autoExit ? "1" : "0";
+    const command = `${formatPiLaunch({ args: parts, env, cwd: profile?.cwd ?? null }, shellQuote)}${SENTINEL_TRAILER}`;
     const launchScriptFile = join(
       artifactDir,
       "subagent-scripts",

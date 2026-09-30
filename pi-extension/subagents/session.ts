@@ -50,6 +50,7 @@ export function seedSubagentSessionFile(params: {
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
+  ponytail?: string;
 }): void {
   const header = {
     type: "session",
@@ -61,6 +62,13 @@ export function seedSubagentSessionFile(params: {
   };
   const contentLines =
     params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  if (params.ponytail) {
+    const lastEntry = contentLines.length ? JSON.parse(contentLines[contentLines.length - 1]) : null;
+    contentLines.push(JSON.stringify({
+      type: "custom", customType: "ponytail-mode", data: { mode: params.ponytail },
+      id: randomUUID(), parentId: lastEntry?.id ?? null, timestamp: new Date().toISOString(),
+    }));
+  }
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });

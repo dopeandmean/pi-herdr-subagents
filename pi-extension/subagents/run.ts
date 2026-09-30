@@ -734,6 +734,7 @@ export async function launchSubagent(
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
+      ponytail: params.ponytail ?? agentDefs?.ponytail,
     });
   }
 

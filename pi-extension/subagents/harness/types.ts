@@ -12,6 +12,7 @@ export interface SubagentLaunchParams {
   resumeSessionId?: string;
   tools?: string;
   skills?: string;
+  ponytail?: "off" | "lite" | "full" | "ultra";
   interactive?: boolean;
 }
 

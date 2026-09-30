@@ -30,8 +30,11 @@ export const SubagentParams = Type.Object({
   ),
   thinking: Type.Optional(ThinkingLevelSchema),
   skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
+    Type.String({ description: "Comma-separated skills to load with the task (overrides agent default). Use none to skip assigned skills; this does not hide the normal skill catalog." }),
   ),
+  ponytail: Type.Optional(Type.Union([
+    Type.Literal("off"), Type.Literal("lite"), Type.Literal("full"), Type.Literal("ultra"),
+  ], { description: "Ponytail mode for this Pi session; overrides the agent default. Requires the installed Ponytail extension." })),
   tools: Type.Optional(
     Type.String({ description: "Comma-separated tools (overrides agent default)" }),
   ),
