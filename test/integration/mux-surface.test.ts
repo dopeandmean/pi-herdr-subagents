@@ -51,7 +51,7 @@ if (herdrAvailable) {
       cleanupTestEnv(env);
     });
 
-    it("keeps focus on the current pane while creating and targeting subagent tabs", async () => {
+    it("keeps focus on the current pane while creating and targeting subagent panes", async () => {
       const focusedPane = getFocusedSurface();
       assert.ok(focusedPane, "Expected herdr to report the currently focused pane");
 

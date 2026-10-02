@@ -11,18 +11,51 @@ describe("herdr.ts", () => {
   });
 
   describe("herdr command construction", () => {
-    it("targets the current workspace when creating a subagent tab", () => {
-      assert.deepEqual(__herdrTest__.buildTabCreateArgs("reviewer", "/repo", "workspace-2"), [
+    it("creates the shared agents tab in the current workspace", () => {
+      assert.deepEqual(__herdrTest__.buildTabCreateArgs("/repo", "workspace-2"), [
         "tab",
         "create",
         "--workspace",
         "workspace-2",
         "--label",
-        "reviewer",
+        "agents",
         "--cwd",
         "/repo",
         "--no-focus",
       ]);
+    });
+
+    it("splits a pane inside the agents tab without stealing focus", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("pane-1", "down", "/repo"), [
+        "pane",
+        "split",
+        "pane-1",
+        "--direction",
+        "down",
+        "--cwd",
+        "/repo",
+        "--no-focus",
+      ]);
+    });
+
+    it("splits the largest pane and picks direction from its shape", () => {
+      const panes = [
+        { pane_id: "small", rect: { width: 40, height: 20 } },
+        { pane_id: "wide", rect: { width: 120, height: 20 } },
+        { pane_id: "tall", rect: { width: 30, height: 60 } },
+      ];
+      assert.deepEqual(__herdrTest__.pickSplitTarget(panes, "fallback"), {
+        paneId: "wide",
+        direction: "right",
+      });
+      assert.deepEqual(
+        __herdrTest__.pickSplitTarget([{ pane_id: "tall", rect: { width: 30, height: 60 } }], "fallback"),
+        { paneId: "tall", direction: "down" },
+      );
+      assert.deepEqual(__herdrTest__.pickSplitTarget([], "fallback"), {
+        paneId: "fallback",
+        direction: "right",
+      });
     });
 
     it("constructs report-metadata arguments with normalized task token", () => {
@@ -61,19 +94,26 @@ describe("herdr.ts", () => {
   });
 
   describe("herdr response parsing", () => {
-    it("extracts root pane id from a tab create response", () => {
+    it("extracts the root pane id from a tab create response", () => {
       const output = JSON.stringify({
         result: {
           tab: { tab_id: "1:2" },
           root_pane: { pane_id: "1-2" },
         },
       });
-      assert.equal(__herdrTest__.extractHerdrRootPaneId(output, "tab create"), "1-2");
+      assert.equal(__herdrTest__.extractHerdrPaneId(output, "tab create", "root_pane"), "1-2");
+    });
+
+    it("extracts the new pane id from a pane split response", () => {
+      const output = JSON.stringify({
+        result: { pane: { pane_id: "1-3" }, type: "pane_info" },
+      });
+      assert.equal(__herdrTest__.extractHerdrPaneId(output, "pane split", "pane"), "1-3");
     });
 
     it("throws on malformed herdr JSON", () => {
       assert.throws(
-        () => __herdrTest__.extractHerdrRootPaneId("not json", "tab create"),
+        () => __herdrTest__.extractHerdrPaneId("not json", "tab create", "root_pane"),
         /Unexpected herdr tab create output/,
       );
     });

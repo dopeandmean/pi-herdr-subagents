@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in a shared herdr agents tab. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 ## How It Works
 
@@ -67,7 +67,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -351,7 +351,7 @@ Phase 4: Execute          → Scout + sequential workers implement todos
 Phase 5: Review           → Reviewer subagent checks all changes
 ```
 
-The parent workspace and tab names stay unchanged. Subagents are created in newly named tabs or panes for each phase.
+The parent workspace and tab names stay unchanged. Subagents are created as named panes in the shared `agents` tab, one pane per phase.
 
 ---
 

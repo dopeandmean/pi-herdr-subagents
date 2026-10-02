@@ -12,6 +12,9 @@ export type { PaneInspection, HerdrAgentStatus };
 
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
+/** Tab that hosts every subagent pane; identified by this label. */
+const AGENTS_TAB_LABEL = "agents";
+
 const commandAvailability = new Map<string, boolean>();
 
 function hasCommand(command: string): boolean {
@@ -73,14 +76,25 @@ function parseHerdrJson(value: string): HerdrJson {
   }
 }
 
-function extractHerdrRootPaneId(output: string, context: string): string {
-  const parsed = parseHerdrJson(output);
-  const paneId = (parsed as { result?: { root_pane?: { pane_id?: unknown } } })?.result?.root_pane
-    ?.pane_id;
+function extractHerdrPaneId(
+  output: string,
+  context: string,
+  key: "root_pane" | "pane",
+): string {
+  const parsed = parseHerdrJson(output) as { result?: Record<string, { pane_id?: unknown }> } | null;
+  const paneId = parsed?.result?.[key]?.pane_id;
   if (typeof paneId !== "string" || !paneId) {
     throw new Error(`Unexpected herdr ${context} output: ${output.trim() || "(empty)"}`);
   }
   return paneId;
+}
+
+function herdrResultRecords(output: string, key: string): Array<Record<string, unknown>> {
+  const parsed = parseHerdrJson(output) as { result?: Record<string, unknown> } | null;
+  const list = parsed?.result?.[key];
+  return Array.isArray(list)
+    ? list.filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object")
+    : [];
 }
 
 function herdrExec(args: string[]): string {
@@ -122,29 +136,99 @@ function getHerdrCurrentPaneInfo(): {
   return { pane_id: paneId, tab_id: tabId, workspace_id: workspaceId };
 }
 
-function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): string[] {
+function buildTabCreateArgs(cwd: string, workspaceId: string): string[] {
   return [
     "tab",
     "create",
     "--workspace",
     workspaceId,
     "--label",
-    name,
+    AGENTS_TAB_LABEL,
     "--cwd",
     cwd,
     "--no-focus",
   ];
 }
 
-/** Create a new herdr tab for one subagent and return its root pane ID. */
+function buildPaneSplitArgs(
+  paneId: string,
+  direction: "right" | "down",
+  cwd: string,
+): string[] {
+  return ["pane", "split", paneId, "--direction", direction, "--cwd", cwd, "--no-focus"];
+}
+
+type LayoutPane = { pane_id?: unknown; rect?: { width?: unknown; height?: unknown } };
+
+/** Largest pane in the tab, with the direction that keeps the split usable. */
+function pickSplitTarget(
+  panes: LayoutPane[],
+  fallbackPaneId: PaneId,
+): { paneId: PaneId; direction: "right" | "down" } {
+  const width = (pane: LayoutPane) => Number(pane.rect?.width ?? 0);
+  const height = (pane: LayoutPane) => Number(pane.rect?.height ?? 0);
+  const candidates = panes.filter((pane) => typeof pane.pane_id === "string");
+  if (!candidates.length) return { paneId: fallbackPaneId, direction: "right" };
+  const largest = candidates.reduce((a, b) =>
+    width(b) * height(b) > width(a) * height(a) ? b : a
+  );
+  // A wide pane splits right, a tall one down — the same rule herdr recommends
+  // for a single split, applied repeatedly to stay near a grid.
+  // ponytail: greedy pick can leave panes uneven (e.g. 50/50/99); rebalance
+  // ratios or resize panes on spawn if herdr ever exposes a layout command.
+  return {
+    paneId: largest.pane_id as PaneId,
+    direction: width(largest) >= height(largest) ? "right" : "down",
+  };
+}
+
+/** Any pane in the shared "agents" tab of this workspace, if that tab exists. */
+function findAgentsTabPane(workspaceId: string): PaneId | undefined {
+  const tabs = herdrResultRecords(
+    herdrExec(["tab", "list", "--workspace", workspaceId]),
+    "tabs",
+  );
+  const tabId = tabs.find((tab) => tab.label === AGENTS_TAB_LABEL)?.tab_id;
+  if (typeof tabId !== "string") return undefined;
+  const panes = herdrResultRecords(
+    herdrExec(["pane", "list", "--workspace", workspaceId]),
+    "panes",
+  );
+  const paneId = panes.find((pane) => pane.tab_id === tabId)?.pane_id;
+  return typeof paneId === "string" ? paneId : undefined;
+}
+
+/** Split the largest pane of the agents tab, returning the new pane ID. */
+function splitAgentsTabPane(anchorPaneId: PaneId, cwd: string): PaneId {
+  const output = herdrExec(["pane", "layout", "--pane", anchorPaneId]);
+  const panes = (parseHerdrJson(output) as { result?: { layout?: { panes?: LayoutPane[] } } } | null)
+    ?.result?.layout?.panes;
+  const target = pickSplitTarget(Array.isArray(panes) ? panes : [], anchorPaneId);
+  return extractHerdrPaneId(
+    herdrExec(buildPaneSplitArgs(target.paneId, target.direction, cwd)),
+    "pane split",
+    "pane",
+  );
+}
+
+/**
+ * Create a subagent pane in the shared "agents" tab, creating that tab on first
+ * use. One tab keeps parallel subagents reachable without a tab each.
+ */
 export function createSubagentPane(name: string): PaneId {
   assertTerminalAvailable();
-  // Create a new tab per subagent so parallel spawns each get a full tab
-  // instead of ever-narrower splits of the parent pane. Target the current
-  // workspace explicitly because Herdr's implicit default may be another space.
+  // Target the current workspace explicitly because Herdr's implicit default may
+  // be another space.
   const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
-  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
-  const paneId = extractHerdrRootPaneId(output, "tab create");
+  const cwd = process.cwd();
+  const anchorPaneId = findAgentsTabPane(workspaceId);
+  const paneId = anchorPaneId
+    ? splitAgentsTabPane(anchorPaneId, cwd)
+    : extractHerdrPaneId(
+      herdrExec(buildTabCreateArgs(cwd, workspaceId)),
+      "tab create",
+      "root_pane",
+    );
   try {
     herdrExec(["pane", "rename", paneId, name]);
   } catch {
@@ -304,9 +388,11 @@ export function setPaneTask(paneId: PaneId, task: string): void {
 
 export const __herdrTest__ = {
   buildTabCreateArgs,
+  buildPaneSplitArgs,
+  pickSplitTarget,
   buildPaneReportTaskArgs,
   parseHerdrJson,
-  extractHerdrRootPaneId,
+  extractHerdrPaneId,
   parsePaneGetOutput,
   parsePaneGetError,
 };

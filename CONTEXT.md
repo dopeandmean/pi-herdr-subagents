@@ -78,6 +78,10 @@ _Avoid_: mux, tmux, terminal manager.
 The herdr pane that hosts one subagent session.
 _Avoid_: surface, window, tab (a tab holds panes; a workspace holds tabs).
 
+**Agents tab**:
+The single herdr tab labelled `agents` in a workspace, holding every subagent pane.
+_Avoid_: subagent tabs, one tab per subagent.
+
 **Widget**:
 The live in-session listing of running subagents and their status projections.
 _Avoid_: sidebar, status bar, HUD.
