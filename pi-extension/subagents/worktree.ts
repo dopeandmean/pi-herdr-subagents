@@ -62,6 +62,18 @@ export interface WorktreeAllocation {
   baseCommit: string;
 }
 
+/**
+ * Durable pointer to the one lane a session owns, written into its launch
+ * profile at allocation time so a resumed session cannot guess an association
+ * from a label or a cwd.
+ */
+export interface LaneReference {
+  laneId: string;
+  artifactDir: string;
+  sessionFile: string;
+  allocation: WorktreeAllocation;
+}
+
 export interface LaneChange {
   status: string;
   path: string;
@@ -106,6 +118,8 @@ export interface HandoffManifest {
   laneId: string;
   name: string;
   agent?: string;
+  /** Session this lane was allocated for; resume validates it before re-attaching. */
+  sessionFile?: string;
   repoRoot: string;
   branch: string;
   worktree: string;
@@ -341,6 +355,7 @@ export function captureHandoff(options: {
   artifactDir: string;
   name: string;
   agent?: string;
+  sessionFile?: string;
   terminalState: LaneTerminalState;
 }): LaneEntry {
   const { allocation, laneId } = options;
@@ -352,11 +367,23 @@ export function captureHandoff(options: {
   const indexPath = join(laneDir, `.capture-index-${process.pid}-${Date.now()}`);
   const at = new Date().toISOString();
 
+  // A recapture is the same lane, not a new one: keep its original identity and
+  // the review/merge evidence already recorded. That evidence stays bound to the
+  // head it names, so the cleanup gate rejects it once the head moves.
+  const previous = readManifest(manifestFile);
+  const lane =
+    previous && previous.laneId === laneId && previous.worktree === allocation.path
+      ? previous
+      : null;
+  const agent = options.agent ?? lane?.agent;
+  const sessionFile = options.sessionFile ?? lane?.sessionFile;
+
   const manifest: HandoffManifest = {
     version: WORKTREE_MANIFEST_VERSION,
     laneId,
-    name: options.name,
-    ...(options.agent ? { agent: options.agent } : {}),
+    name: lane?.name ?? options.name,
+    ...(agent ? { agent } : {}),
+    ...(sessionFile ? { sessionFile } : {}),
     repoRoot: allocation.repoRoot,
     branch: allocation.branch,
     worktree: allocation.path,
@@ -370,8 +397,10 @@ export function captureHandoff(options: {
     patchBytes: 0,
     capture: { ok: false, at },
     terminalState: options.terminalState,
+    ...(lane?.review ? { review: lane.review } : {}),
+    ...(lane?.merge ? { merge: lane.merge } : {}),
     cleanup: { status: "pending" },
-    createdAt: at,
+    createdAt: lane?.createdAt ?? at,
   };
 
   try {
@@ -477,6 +506,107 @@ export function listLanes(artifactDir: string, scope?: string): LaneEntry[] {
     return manifest ? [{ manifest, manifestFile: scope }] : [];
   }
   return readLaneEntries(artifactDir).filter((entry) => entry.manifest.laneId === scope);
+}
+
+/** Lanes whose manifest records this session — the evidence a durable reference must match. */
+export function lanesForSession(artifactDir: string, sessionPath: string): LaneEntry[] {
+  return readLaneEntries(artifactDir).filter((entry) => entry.manifest.sessionFile === sessionPath);
+}
+
+/**
+ * Lanes whose recorded worktree contains `cwd`. Ownership is never inferred
+ * from this: a session with no durable lane reference must not resume into a
+ * lane whose edits nothing would recapture. Only absolute recorded paths count:
+ * a relative value would resolve against this process's cwd and could falsely
+ * claim it as lane-owned.
+ */
+export function lanesContaining(artifactDir: string, cwd: string | null): LaneEntry[] {
+  if (!cwd) return [];
+  return readLaneEntries(artifactDir).filter(
+    (entry) =>
+      typeof entry.manifest.worktree === "string" &&
+      isAbsolute(entry.manifest.worktree) &&
+      isInside(entry.manifest.worktree, cwd),
+  );
+}
+
+/**
+ * Read-only verdict on whether a durable lane reference still describes the one
+ * lane this session owns: the recorded manifest must record the session, agree
+ * on the lane's identity, and still be registered on its own branch inside the
+ * lane worktree. Every failure preserves the lane, the branch and the evidence.
+ */
+export function validateLaneResume(options: {
+  reference: LaneReference;
+  sessionPath: string;
+  cwd: string | null;
+}): { ok: true; allocation: WorktreeAllocation } | { ok: false; error: string } {
+  const { reference, sessionPath } = options;
+  const reject = (error: string) => ({ ok: false as const, error });
+
+  if (reference.sessionFile !== sessionPath) {
+    return reject(`the lane reference belongs to session ${reference.sessionFile}, not ${sessionPath}`);
+  }
+
+  const recorded = lanesForSession(reference.artifactDir, sessionPath);
+  if (recorded.length > 1) {
+    return reject(
+      `lane evidence for this session is ambiguous: ${recorded
+        .map((entry) => entry.manifest.laneId)
+        .join(", ")}`,
+    );
+  }
+
+  const manifestFile = manifestFileFor(reference.artifactDir, reference.laneId);
+  const manifest = readManifest(manifestFile);
+  if (!manifest) return reject(`no lane manifest at ${manifestFile}`);
+  if (manifest.cleanup?.status === "removed") return reject(`lane ${manifest.laneId} was already removed`);
+
+  const allocation = reference.allocation;
+  const disagreement =
+    manifest.laneId !== reference.laneId
+      ? `lane id ${manifest.laneId} != ${reference.laneId}`
+      : manifest.repoRoot !== allocation.repoRoot
+        ? `repository ${manifest.repoRoot} != ${allocation.repoRoot}`
+        : manifest.branch !== allocation.branch
+          ? `branch ${manifest.branch} != ${allocation.branch}`
+          : manifest.worktree !== allocation.path
+            ? `worktree ${manifest.worktree} != ${allocation.path}`
+            : manifest.baseRef !== allocation.baseRef
+              ? `base ref ${manifest.baseRef} != ${allocation.baseRef}`
+              : manifest.baseCommit !== allocation.baseCommit
+                ? `base commit ${manifest.baseCommit} != ${allocation.baseCommit}`
+                : null;
+  if (disagreement) return reject(`lane evidence does not match the reference (${disagreement})`);
+  if (manifest.sessionFile === undefined) {
+    return reject("lane evidence predates the session record, so its ownership cannot be verified");
+  }
+  if (manifest.sessionFile !== sessionPath) {
+    return reject(`lane evidence belongs to session ${manifest.sessionFile}, not ${sessionPath}`);
+  }
+
+  if (!existsSync(allocation.path)) return reject(`worktree is gone: ${allocation.path}`);
+  if (resolveRepoRoot(allocation.repoRoot) !== allocation.repoRoot) {
+    return reject(`repository root no longer resolves to ${allocation.repoRoot}`);
+  }
+  const registered = registeredWorktrees(allocation.repoRoot);
+  if (!registered.has(allocation.path)) {
+    return reject(`worktree is not registered in the repository: ${allocation.path}`);
+  }
+  if (registered.get(allocation.path) !== allocation.branch) {
+    return reject(
+      `worktree is registered on branch ${registered.get(allocation.path)}, not ${allocation.branch}`,
+    );
+  }
+  const branchNow = tryGit(["symbolic-ref", "--short", "HEAD"], { cwd: allocation.path })?.trim();
+  if (branchNow !== allocation.branch) {
+    return reject(`worktree is checked out on ${branchNow ?? "(detached)"}, not ${allocation.branch}`);
+  }
+  if (!options.cwd || !isInside(allocation.path, options.cwd)) {
+    return reject(`recorded cwd ${options.cwd ?? "(none)"} is not inside the lane ${allocation.path}`);
+  }
+
+  return { ok: true, allocation };
 }
 
 function registeredWorktrees(repoRoot: string): Map<string, string> {

@@ -256,7 +256,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ## Isolated Worktree Lanes
 
-Parallel writers normally share one checkout. With `worktree: true` the child gets its own Git worktree and branch, so two workers cannot see or clobber each other's edits:
+Parallel writers normally share one checkout. With `worktree: true` the child gets its own Git worktree and branch, so two workers cannot see or clobber each other's edits. A lane is owned by the session that launched it, not by one run: resuming that session reattaches to the same lane — from the durable reference in its launch profile, never from a matching label or cwd — and recaptures its manifest and patch, while the resumed run keeps its own run id:
 
 ```typescript
 subagent({ name: "Parser", agent: "subagent-worker", worktree: true, task: "Rewrite the parser..." });
@@ -423,7 +423,7 @@ Per-call `skills` and `ponytail` override the agent defaults. Skill lists are co
 
 The subagent resolves assignments from its own enabled Pi skill catalog (including package skills) and receives their full instructions with the task. Missing or unreadable assignments fail the run before task execution. No separate skill-only turns are started. References retain each skill's source directory.
 
-Pi launches save a `.launch.json` beside the session. `subagent_resume` reuses the role prompt, tools, skill assignments, mode defaults and cwd while assigning a fresh run identity. Sessions predating this profile keep the legacy resume behavior. Keep the generated prompt files and launch profile with the session when resuming it.
+Pi launches save a `.launch.json` beside the session. `subagent_resume` reuses the role prompt, tools, skill assignments, mode defaults and cwd while assigning a fresh run identity. Lane ownership is never inferred: a durable lane reference that cannot be verified (removed, ambiguous, or mismatched) refuses the resume before any pane opens, leaving the lane's manifest, patch, branch and worktree untouched. An absent reference is refused only when lane evidence already names that session, or the recorded cwd lies inside a lane worktree; a legacy session outside every lane keeps the ordinary legacy resume behavior. Keep the generated prompt files and launch profile with the session when resuming it.
 
 ### `session-mode`
 

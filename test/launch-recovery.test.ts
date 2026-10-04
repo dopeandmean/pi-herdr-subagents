@@ -5,12 +5,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getDefaultSessionDirFor } from "../pi-extension/subagents/discovery.ts";
-import { cleanupSubagentsForShutdown, getArtifactDir, launchSubagent, runningSubagents, stopTracking, watchSubagentRun } from "../pi-extension/subagents/run.ts";
+import { cleanupSubagentsForShutdown, getArtifactDir, launchSubagent, runningSubagents, stopTracking, watchSubagent, watchSubagentRun } from "../pi-extension/subagents/run.ts";
 import { registerHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 import { createTool as createResumeTool } from "../pi-extension/subagents/tools/resume.ts";
 import { listLanes } from "../pi-extension/subagents/worktree.ts";
-import { createMockExtensionApi, createSessionFile, SESSION_HEADER, USER_MSG } from "./helpers.ts";
+import { writeCompletionSidecar } from "../pi-extension/subagents/handoff.ts";
+import { createMockExtensionApi, createSessionFile, SESSION_HEADER, USER_MSG, writeAgentFile } from "./helpers.ts";
 
 /**
  * A herdr stand-in on PATH: every command is logged, nothing touches a terminal.
@@ -25,7 +26,9 @@ case "$1 $2" in
   "pane list") printf '%s\\n' '{"result":{"panes":[]}}' ;;
   "pane split") printf '%s\\n' '{"result":{"pane":{"pane_id":"fx:2"}}}' ;;
   "pane get") printf '{"result":{"pane":{"pane_id":"%s","agent":"pi","agent_status":"done"}}}\\n' "$3" ;;
-  "pane read") printf '%s\\n' '__SUBAGENT_DONE_0__' ;;
+  "pane read")
+    # A test can hold a resumed child "running" while it stages follow-up work.
+    if [ "$FAKE_HERDR_DONE" = "0" ]; then printf '\\n'; else printf '%s\\n' '__SUBAGENT_DONE_0__'; fi ;;
   *)
     if [ "$1 $2" = "pane run" ] && [ "$FAKE_HERDR_FAIL_ON" = "pane run" ]; then
       printf '%s\\n' 'fake herdr: pane run refused' >&2
@@ -53,6 +56,7 @@ const ENV_NAMES = [
   "PI_SUBAGENT_SHELL_READY_DELAY_MS",
   "FAKE_HERDR_LOG",
   "FAKE_HERDR_FAIL_ON",
+  "FAKE_HERDR_DONE",
 ];
 
 function parentSession(name: string, entries: object[]): string {
@@ -100,6 +104,24 @@ function launchContext(options: { sessionDir: string; parentSessionFile: string;
   };
 }
 
+/** Stand in for the session file a real child Pi writes once it starts. */
+function childSessionFile(sessionFile: string, cwd: string): void {
+  mkdirSync(dirname(sessionFile), { recursive: true });
+  writeFileSync(
+    sessionFile,
+    `${JSON.stringify({ type: "session", id: "child-session", version: 3, cwd })}\n`,
+  );
+}
+
+async function waitFor(predicate: () => boolean, what: string, timeoutMs = 8_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
 function singleLane(lanes: string): { lanePath: string; laneId: string } {
   const entries = readdirSync(lanes).filter((entry) => entry.startsWith("pi-worktree-"));
   assert.equal(entries.length, 1, `expected exactly one lane, got ${entries.join(", ")}`);
@@ -126,6 +148,7 @@ before(() => {
   process.env.PI_SUBAGENTS_WORKTREE_DIR = lanesRoot;
   process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
   process.env.FAKE_HERDR_LOG = logFile;
+  process.env.FAKE_HERDR_DONE = "1";
 });
 
 after(() => {
@@ -404,6 +427,319 @@ describe("resume artifacts", () => {
     } finally {
       // Let the aborted watchers settle while the fake herdr is still on PATH:
       // a resumed run must not deliver its result or touch the real CLI after teardown.
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      stopTracking();
+    }
+  });
+});
+
+describe("lane re-attachment on resume", () => {
+  it("re-captures the session's own lane while the resumed run gets fresh artifacts", async () => {
+    const repo = join(sandbox, "resume-lane-repo");
+    makeRepo(repo);
+    const lanes = join(sandbox, "resume-lane-lanes");
+    const sessionDir = join(sandbox, "resume-lane-sessions");
+    const parentSessionFile = parentSession("resume-lane-parent", [SESSION_HEADER, USER_MSG]);
+    const artifactDir = getArtifactDir(sessionDir, "sess-launch");
+    writeAgentFile(join(agentDir, "agents"), "lane-role", "name: lane-role");
+    const lanesBefore = process.env.PI_SUBAGENTS_WORKTREE_DIR;
+    process.env.PI_SUBAGENTS_WORKTREE_DIR = lanes;
+
+    try {
+      const launched = await launchSubagent(
+        { name: "Lane Worker", agent: "lane-role", task: "do the work", worktree: true, cwd: repo },
+        launchContext({ sessionDir, parentSessionFile, cwd: repo }),
+        "medium",
+      );
+      const laneId = launched.worktree!.laneId;
+      const lanePath = launched.worktree!.allocation.path;
+      const manifestFile = join(artifactDir, "subagent-worktrees", laneId, "manifest.json");
+      childSessionFile(launched.sessionFile, lanePath);
+
+      // The child did the first round of work, then pinged for help and ended.
+      writeFileSync(join(lanePath, "first.txt"), "first round\n");
+      writeCompletionSidecar(launched.sessionFile, {
+        type: "ping",
+        name: launched.name,
+        message: "needs a hand",
+      });
+      const pinged = await watchSubagent(launched, new AbortController().signal);
+      assert.equal(pinged.ping?.message, "needs a hand");
+
+      const firstManifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+      const firstPatch = readFileSync(firstManifest.patchFile, "utf8");
+      assert.equal(firstManifest.laneId, laneId);
+      assert.equal(firstManifest.sessionFile, launched.sessionFile);
+      assert.deepEqual(firstManifest.changedPaths.map((change: any) => change.path), ["first.txt"]);
+
+      // The launch profile is the durable lane reference resume reads back.
+      const profile = JSON.parse(readFileSync(`${launched.sessionFile}.launch.json`, "utf8"));
+      assert.equal(profile.lane.laneId, laneId);
+      assert.equal(profile.lane.artifactDir, artifactDir);
+      assert.equal(profile.lane.sessionFile, launched.sessionFile);
+      assert.equal(profile.lane.allocation.path, lanePath);
+
+      const { api } = createMockExtensionApi();
+      const resume = createResumeTool(api);
+      const ctx = {
+        sessionManager: { getSessionId: () => "sess-launch", getSessionDir: () => sessionDir },
+      } as any;
+
+      // Keep the resumed child running until its follow-up work is staged.
+      process.env.FAKE_HERDR_DONE = "0";
+      const resumed: any = await resume.execute(
+        "call-1",
+        { sessionPath: launched.sessionFile, name: "Lane Follow-up", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(resumed.details.status, "started");
+
+      const resumeId = resumed.details.id;
+      assert.notEqual(resumeId, laneId, "the resumed run keeps its own run id");
+      const resumedRunning = runningSubagents.get(resumeId);
+      assert.ok(resumedRunning, "the resumed run is tracked");
+      assert.equal(resumedRunning.worktree?.laneId, laneId);
+      assert.equal(resumedRunning.worktree?.allocation.path, lanePath);
+      assert.equal(resumedRunning.agent, "lane-role", "the lane's role provenance is restored");
+      assert.equal(resumedRunning.sessionFile, launched.sessionFile);
+      // Activity and context artifacts belong to the fresh run, not to the lane.
+      assert.notEqual(resumedRunning.activityFile, launched.activityFile);
+      assert.match(resumedRunning.activityFile!, new RegExp(`/${resumeId}\\.json$`));
+      const resumeScript = readFileSync(resumed.details.launchScriptFile, "utf8");
+      const resumeMsgFile = resumeScript.match(/'@([^']+\.md)'/)?.[1] ?? "";
+      assert.ok(resumeMsgFile, `expected a resume message file in: ${resumeScript}`);
+      assert.match(resumeMsgFile, new RegExp(`-${resumeId}\\.md$`));
+
+      // Follow-up work happens in the same lane after the resume.
+      writeFileSync(join(lanePath, "second.txt"), "follow-up round\n");
+      process.env.FAKE_HERDR_DONE = "1";
+      await waitFor(() => !runningSubagents.has(resumeId), "the resumed run to finish");
+
+      const recaptured = JSON.parse(readFileSync(manifestFile, "utf8"));
+      assert.equal(recaptured.laneId, laneId);
+      assert.equal(recaptured.branch, firstManifest.branch);
+      assert.equal(recaptured.worktree, lanePath);
+      assert.equal(recaptured.sessionFile, launched.sessionFile);
+      assert.equal(recaptured.agent, "lane-role");
+      assert.equal(recaptured.name, firstManifest.name, "the lane keeps its original name");
+      assert.equal(recaptured.createdAt, firstManifest.createdAt, "the lane keeps its original createdAt");
+      assert.deepEqual(
+        recaptured.changedPaths.map((change: any) => change.path).sort(),
+        ["first.txt", "second.txt"],
+      );
+      const recapturedPatch = readFileSync(recaptured.patchFile, "utf8");
+      assert.notEqual(recapturedPatch, firstPatch, "the patch now carries the follow-up work");
+      assert.match(recapturedPatch, /first\.txt/);
+      assert.match(recapturedPatch, /second\.txt/);
+      // Follow-up work never spawns a second lane, and the lane itself is intact.
+      assert.equal(readdirSync(lanes).length, 1);
+      assert.equal(git(["symbolic-ref", "--short", "HEAD"], lanePath).trim(), firstManifest.branch);
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+    } finally {
+      process.env.FAKE_HERDR_DONE = "1";
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      process.env.PI_SUBAGENTS_WORKTREE_DIR = lanesBefore;
+    }
+  });
+
+  it("refuses a mismatched or ambiguous lane association before opening a pane", async () => {
+    const repo = join(sandbox, "resume-reject-repo");
+    makeRepo(repo);
+    const lanes = join(sandbox, "resume-reject-lanes");
+    const sessionDir = join(sandbox, "resume-reject-sessions");
+    const parentSessionFile = parentSession("resume-reject-parent", [SESSION_HEADER, USER_MSG]);
+    const artifactDir = getArtifactDir(sessionDir, "sess-launch");
+    const lanesBefore = process.env.PI_SUBAGENTS_WORKTREE_DIR;
+    process.env.PI_SUBAGENTS_WORKTREE_DIR = lanes;
+
+    try {
+      const launched = await launchSubagent(
+        { name: "Reject Worker", task: "do the work", worktree: true, cwd: repo },
+        launchContext({ sessionDir, parentSessionFile, cwd: repo }),
+        "medium",
+      );
+      const laneId = launched.worktree!.laneId;
+      const lanePath = launched.worktree!.allocation.path;
+      const manifestFile = join(artifactDir, "subagent-worktrees", laneId, "manifest.json");
+      childSessionFile(launched.sessionFile, lanePath);
+
+      writeFileSync(join(lanePath, "work.txt"), "work\n");
+      writeCompletionSidecar(launched.sessionFile, { type: "done" });
+      await watchSubagent(launched, new AbortController().signal);
+
+      const manifestBefore = readFileSync(manifestFile, "utf8");
+      const evidence = JSON.parse(manifestBefore);
+      const patchBefore = readFileSync(evidence.patchFile, "utf8");
+      const profileFile = `${launched.sessionFile}.launch.json`;
+
+      const { api } = createMockExtensionApi();
+      const resume = createResumeTool(api);
+      const ctx = {
+        sessionManager: { getSessionId: () => "sess-launch", getSessionDir: () => sessionDir },
+      } as any;
+
+      // The profile points at a worktree the lane does not own.
+      const profile = JSON.parse(readFileSync(profileFile, "utf8"));
+      profile.lane.allocation.path = join(lanes, "pi-worktree-somewhere-else");
+      writeFileSync(profileFile, JSON.stringify(profile));
+      writeFileSync(logFile, "");
+
+      const mismatched: any = await resume.execute(
+        "call-1",
+        { sessionPath: launched.sessionFile, name: "Mismatch", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.notEqual(mismatched.details.status, "started");
+      assert.match(mismatched.content[0].text, /refusing to resume/i);
+      assert.match(mismatched.content[0].text, /does not match the reference/);
+
+      // Lane evidence without a durable reference cannot be verified either.
+      delete profile.lane;
+      writeFileSync(profileFile, JSON.stringify(profile));
+      writeFileSync(logFile, "");
+
+      const ambiguous: any = await resume.execute(
+        "call-2",
+        { sessionPath: launched.sessionFile, name: "Ambiguous", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.notEqual(ambiguous.details.status, "started");
+      assert.match(ambiguous.content[0].text, /refusing to resume/i);
+      assert.match(ambiguous.content[0].text, /no lane reference/);
+      assert.doesNotMatch(readFileSync(logFile, "utf8"), /tab create|pane split|pane run/, "no pane may be opened");
+
+      // Every rejection preserves the lane: manifest, patch, branch and worktree.
+      assert.equal(readFileSync(manifestFile, "utf8"), manifestBefore);
+      assert.equal(readFileSync(evidence.patchFile, "utf8"), patchBefore);
+      assert.equal(existsSync(lanePath), true);
+      assert.equal(git(["symbolic-ref", "--short", "HEAD"], lanePath).trim(), evidence.branch);
+      assert.equal(readdirSync(lanes).length, 1);
+    } finally {
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      process.env.PI_SUBAGENTS_WORKTREE_DIR = lanesBefore;
+    }
+  });
+
+  it("refuses a legacy lane session with no durable reference and preserves its evidence", async () => {
+    const repo = join(sandbox, "legacy-lane-repo");
+    makeRepo(repo);
+    const lanes = join(sandbox, "legacy-lane-lanes");
+    const sessionDir = join(sandbox, "legacy-lane-sessions");
+    const parentSessionFile = parentSession("legacy-lane-parent", [SESSION_HEADER, USER_MSG]);
+    const artifactDir = getArtifactDir(sessionDir, "sess-launch");
+    const lanesBefore = process.env.PI_SUBAGENTS_WORKTREE_DIR;
+    process.env.PI_SUBAGENTS_WORKTREE_DIR = lanes;
+
+    try {
+      const launched = await launchSubagent(
+        { name: "Legacy Worker", task: "do the work", worktree: true, cwd: repo },
+        launchContext({ sessionDir, parentSessionFile, cwd: repo }),
+        "medium",
+      );
+      const laneId = launched.worktree!.laneId;
+      const lanePath = launched.worktree!.allocation.path;
+      const manifestFile = join(artifactDir, "subagent-worktrees", laneId, "manifest.json");
+      childSessionFile(launched.sessionFile, lanePath);
+
+      writeFileSync(join(lanePath, "legacy.txt"), "legacy work\n");
+      writeCompletionSidecar(launched.sessionFile, { type: "done" });
+      await watchSubagent(launched, new AbortController().signal);
+
+      // Legacy evidence: the manifest never recorded a session, and the profile
+      // predates the durable lane reference. Its cwd is still inside the lane.
+      const legacy = JSON.parse(readFileSync(manifestFile, "utf8"));
+      delete legacy.sessionFile;
+      writeFileSync(manifestFile, `${JSON.stringify(legacy, null, 2)}\n`);
+      const manifestBefore = readFileSync(manifestFile, "utf8");
+      const patchBefore = readFileSync(legacy.patchFile, "utf8");
+      const profileFile = `${launched.sessionFile}.launch.json`;
+      const profile = JSON.parse(readFileSync(profileFile, "utf8"));
+      assert.ok(profile.cwd.startsWith(lanePath), `expected a lane cwd, got ${profile.cwd}`);
+      delete profile.lane;
+      writeFileSync(profileFile, JSON.stringify(profile));
+
+      const { api } = createMockExtensionApi();
+      const resume = createResumeTool(api);
+      const ctx = {
+        sessionManager: { getSessionId: () => "sess-launch", getSessionDir: () => sessionDir },
+      } as any;
+      writeFileSync(logFile, "");
+
+      const refused: any = await resume.execute(
+        "call-1",
+        { sessionPath: launched.sessionFile, name: "Legacy", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.notEqual(refused.details.status, "started");
+      assert.match(refused.content[0].text, /refusing to resume/i);
+      assert.match(refused.content[0].text, /inside lane worktree/i);
+      assert.doesNotMatch(readFileSync(logFile, "utf8"), /tab create|pane split|pane run/, "no pane may be opened");
+
+      // A second manifest claiming the same worktree makes it ambiguous, not allowed.
+      const duplicateDir = join(artifactDir, "subagent-worktrees", "legacy-other");
+      mkdirSync(duplicateDir, { recursive: true });
+      writeFileSync(join(duplicateDir, "manifest.json"), JSON.stringify({ ...legacy, laneId: "legacy-other" }));
+      const ambiguous: any = await resume.execute(
+        "call-2",
+        { sessionPath: launched.sessionFile, name: "Legacy", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.notEqual(ambiguous.details.status, "started");
+      assert.match(ambiguous.content[0].text, /multiple lanes contain it/);
+
+      // Every refusal preserves the lane: manifest, patch, worktree and branch.
+      assert.equal(readFileSync(manifestFile, "utf8"), manifestBefore);
+      assert.equal(readFileSync(legacy.patchFile, "utf8"), patchBefore);
+      assert.equal(existsSync(lanePath), true);
+      assert.equal(git(["symbolic-ref", "--short", "HEAD"], lanePath).trim(), legacy.branch);
+      assert.equal(readdirSync(lanes).length, 1);
+      assert.doesNotMatch(readFileSync(logFile, "utf8"), /tab create|pane split|pane run/, "no pane may be opened");
+    } finally {
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      process.env.PI_SUBAGENTS_WORKTREE_DIR = lanesBefore;
+    }
+  });
+
+  it("still resumes a legacy session whose cwd is outside every lane", async () => {
+    const sessionDir = join(sandbox, "legacy-plain-sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionPath = parentSession("legacy-plain-parent", [SESSION_HEADER, USER_MSG]);
+    writeFileSync(
+      `${sessionPath}.launch.json`,
+      JSON.stringify({ args: ["pi", "--session", sessionPath], env: {}, cwd: sandbox }),
+    );
+
+    const { api } = createMockExtensionApi();
+    const resume = createResumeTool(api);
+    const ctx = {
+      sessionManager: { getSessionId: () => "sess-legacy-plain", getSessionDir: () => sessionDir },
+    } as any;
+
+    try {
+      writeFileSync(logFile, "");
+      process.env.FAKE_HERDR_DONE = "0";
+      const resumed: any = await resume.execute(
+        "call-1",
+        { sessionPath, name: "Plain Resume", message: "continue" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(resumed.details.status, "started");
+      assert.match(readFileSync(logFile, "utf8"), /pane run/);
+    } finally {
+      process.env.FAKE_HERDR_DONE = "1";
       cleanupSubagentsForShutdown("quit", runningSubagents);
       await new Promise((resolve) => setTimeout(resolve, 250));
       stopTracking();

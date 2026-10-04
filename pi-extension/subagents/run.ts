@@ -213,8 +213,11 @@ export interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
-  /** Isolated worktree lane for this run, when spawned with `worktree: true`. */
-  worktree?: { allocation: WorktreeAllocation; artifactDir: string };
+  /**
+   * Isolated worktree lane for this run. A resumed run restores the lane it
+   * already owns, so its own run id stays separate from the lane's.
+   */
+  worktree?: { allocation: WorktreeAllocation; artifactDir: string; laneId: string };
 }
 
 export interface SubagentRuntime {
@@ -666,6 +669,7 @@ function recordedLaunchFailure(params: {
   agent?: string;
   id: string;
   artifactDir: string;
+  sessionFile?: string;
   allocation?: WorktreeAllocation;
   surface: string | null;
   ownsSurface: boolean;
@@ -682,6 +686,7 @@ function recordedLaunchFailure(params: {
         artifactDir: params.artifactDir,
         name: params.name,
         agent: params.agent,
+        sessionFile: params.sessionFile,
         // The child never started; -1 marks "no child exit code" in the receipt.
         terminalState: { status: "failed", exitCode: -1 },
       });
@@ -880,6 +885,16 @@ export async function launchSubagent(
       summaryInstruction,
       subagentsDir: SUBAGENTS_DIR,
       shellQuote,
+      ...(worktreeAllocation
+        ? {
+            lane: {
+              laneId: id,
+              artifactDir,
+              sessionFile: subagentSessionFile,
+              allocation: worktreeAllocation,
+            },
+          }
+        : {}),
     });
 
     const launchScriptName = `${(params.name || "subagent")
@@ -912,7 +927,9 @@ export async function launchSubagent(
       sentinelFile: built.sentinelFile,
       interactive: effectiveInteractive,
       runtimePlan,
-      ...(worktreeAllocation ? { worktree: { allocation: worktreeAllocation, artifactDir } } : {}),
+      ...(worktreeAllocation
+        ? { worktree: { allocation: worktreeAllocation, artifactDir, laneId: id } }
+        : {}),
       activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
       lifecycle: !driver.hasActivitySnapshots
         ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -928,6 +945,7 @@ export async function launchSubagent(
       agent: params.agent,
       id,
       artifactDir,
+      sessionFile: subagentSessionFile,
       allocation: worktreeAllocation,
       surface,
       ownsSurface: !surfacePreCreated,
@@ -962,10 +980,11 @@ export function finalizeWorktreeLane(
   try {
     entry = captureHandoff({
       allocation: lane.allocation,
-      laneId: running.id,
+      laneId: lane.laneId,
       artifactDir: lane.artifactDir,
       name: running.name,
       agent: running.agent,
+      sessionFile: running.sessionFile,
       terminalState,
     });
     if (!entry.manifest.capture.ok) captureError = entry.manifest.capture.error ?? "unknown error";
@@ -988,7 +1007,7 @@ export function finalizeWorktreeLane(
   return {
     ...result,
     worktreeLane: {
-      laneId: running.id,
+      laneId: lane.laneId,
       branch: lane.allocation.branch,
       worktree: lane.allocation.path,
       ...(entry ? { manifestFile: entry.manifestFile } : {}),

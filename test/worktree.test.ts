@@ -8,10 +8,13 @@ import {
   allocateWorktree,
   captureHandoff,
   inspectLane,
+  lanesContaining,
   listLanes,
   recordLaneEvidence,
   removeLane,
+  validateLaneResume,
   type LaneEntry,
+  type LaneReference,
 } from "../pi-extension/subagents/worktree.ts";
 
 function git(args: string[], cwd: string): string {
@@ -595,6 +598,95 @@ describe("cleanup and evidence", () => {
     assert.equal(git(["branch", "--list", entry.manifest.branch], repo).trim(), "");
   });
 
+  it("preserves a re-captured lane's identity and its recorded evidence", () => {
+    const entry = changedLane(id);
+    const original = laneEntry(id).manifest;
+    assert.equal(
+      recordLaneEvidence(entry, { review: { verdict: "OK", reviewer: "reviewer" } }).ok,
+      true,
+    );
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
+    const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
+    assert.equal(
+      recordLaneEvidence(entry, { merge: { commit: mergeCommit, attestor: "parent" } }).ok,
+      true,
+    );
+    const reviewed = laneEntry(id).manifest;
+    assert.equal(inspectLane(laneEntry(id)).removable, true);
+
+    // A resumed run re-captures the lane under its own display name.
+    const recaptured = captureHandoff({
+      allocation: {
+        repoRoot: reviewed.repoRoot,
+        branch: reviewed.branch,
+        path: reviewed.worktree,
+        baseRef: reviewed.baseRef,
+        baseCommit: reviewed.baseCommit,
+      },
+      laneId: id,
+      artifactDir,
+      name: "Resume",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+
+    assert.equal(recaptured.manifest.capture.ok, true);
+    assert.equal(recaptured.manifest.createdAt, original.createdAt);
+    assert.equal(recaptured.manifest.name, original.name);
+    assert.deepEqual(recaptured.manifest.review, reviewed.review);
+    assert.deepEqual(recaptured.manifest.merge, reviewed.merge);
+    // The head did not move, so the preserved evidence still authorizes cleanup.
+    assert.equal(inspectLane(recaptured).removable, true);
+  });
+
+  it("keeps historical evidence after the head moves and refuses cleanup as stale", () => {
+    const entry = changedLane(id);
+    assert.equal(
+      recordLaneEvidence(entry, { review: { verdict: "OK", reviewer: "reviewer" } }).ok,
+      true,
+    );
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
+    const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
+    assert.equal(
+      recordLaneEvidence(entry, { merge: { commit: mergeCommit, attestor: "parent" } }).ok,
+      true,
+    );
+    const reviewed = laneEntry(id).manifest;
+    assert.equal(inspectLane(laneEntry(id)).removable, true);
+
+    // Follow-up work lands after the reviewed head.
+    writeFileSync(join(reviewed.worktree, "follow-up.txt"), "after review\n");
+    git(["add", "-A"], reviewed.worktree);
+    git(["commit", "-q", "-m", "follow-up work"], reviewed.worktree);
+
+    const recaptured = captureHandoff({
+      allocation: {
+        repoRoot: reviewed.repoRoot,
+        branch: reviewed.branch,
+        path: reviewed.worktree,
+        baseRef: reviewed.baseRef,
+        baseCommit: reviewed.baseCommit,
+      },
+      laneId: id,
+      artifactDir,
+      name: "Resume",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+
+    // The old evidence survives, still bound to the head it named.
+    assert.deepEqual(recaptured.manifest.review, reviewed.review);
+    assert.deepEqual(recaptured.manifest.merge, reviewed.merge);
+    assert.notEqual(recaptured.manifest.headCommit, reviewed.headCommit);
+
+    const inspection = inspectLane(recaptured);
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /review is stale for the captured head/);
+    assert.match(inspection.blockers.join(" "), /integration evidence does not match the reviewed head/);
+    const removed = removeLane(recaptured);
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(reviewed.worktree), true);
+    assert.ok(existsSync(reviewed.patchFile));
+  });
+
   it("refuses evidence for a lane whose capture failed", () => {
     const failedId = `${id}f`;
     const failed = captureHandoff({
@@ -616,5 +708,155 @@ describe("cleanup and evidence", () => {
     });
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /capture failed/);
+  });
+});
+
+describe("lane resume validation", () => {
+  const completed = { status: "completed" as const, exitCode: 0 };
+
+  function laneWithSession(id: string, sessionFile: string): { entry: LaneEntry; reference: LaneReference } {
+    const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+    const entry = captureHandoff({
+      allocation,
+      laneId: id,
+      artifactDir,
+      name: "worker",
+      sessionFile,
+      terminalState: completed,
+    });
+    return {
+      entry,
+      reference: {
+        laneId: id,
+        artifactDir,
+        sessionFile,
+        allocation: {
+          repoRoot: entry.manifest.repoRoot,
+          branch: entry.manifest.branch,
+          path: entry.manifest.worktree,
+          baseRef: entry.manifest.baseRef,
+          baseCommit: entry.manifest.baseCommit,
+        },
+      },
+    };
+  }
+
+  it("accepts a reference whose evidence and Git state still match", () => {
+    const sessionFile = join(sandbox, "resume-ok.jsonl");
+    const { reference, entry } = laneWithSession("resume001", sessionFile);
+
+    const result = validateLaneResume({ reference, sessionPath: sessionFile, cwd: entry.manifest.worktree });
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.allocation.branch, entry.manifest.branch);
+
+    // A child started in a repository subdirectory is still inside its lane.
+    assert.equal(
+      validateLaneResume({ reference, sessionPath: sessionFile, cwd: join(entry.manifest.worktree, "packages", "app") }).ok,
+      true,
+    );
+  });
+
+  it("rejects missing, removed, foreign, duplicate, legacy and mismatched associations", () => {
+    const sessionFile = join(sandbox, "resume-checks.jsonl");
+    const otherSession = join(sandbox, "resume-other.jsonl");
+    const { reference, entry } = laneWithSession("resume002", sessionFile);
+    const manifestFile = entry.manifestFile;
+    const worktree = entry.manifest.worktree;
+
+    const rejected = (options: {
+      reference?: LaneReference;
+      sessionPath?: string;
+      cwd?: string | null;
+    }): string => {
+      const result = validateLaneResume({
+        reference,
+        sessionPath: sessionFile,
+        cwd: worktree,
+        ...options,
+      });
+      assert.equal(result.ok, false, `expected a rejection for ${JSON.stringify(options)}`);
+      return result.ok ? "" : result.error;
+    };
+
+    const original = readFileSync(manifestFile, "utf8");
+    const editManifest = (update: (manifest: any) => void) => {
+      const manifest = JSON.parse(original);
+      update(manifest);
+      writeFileSync(manifestFile, JSON.stringify(manifest));
+    };
+
+    // Foreign: the reference names another session.
+    assert.match(rejected({ reference: { ...reference, sessionFile: otherSession } }), /resume-other\.jsonl/);
+    // The recorded cwd must belong to the lane.
+    assert.match(rejected({ cwd: repo }), /not inside the lane/);
+    assert.match(rejected({ cwd: null }), /not inside the lane/);
+    // Foreign: the evidence names another session.
+    editManifest((manifest) => { manifest.sessionFile = otherSession; });
+    assert.match(rejected({}), /resume-other\.jsonl/);
+    // Legacy: evidence that never recorded a session cannot prove ownership.
+    editManifest((manifest) => { delete manifest.sessionFile; });
+    assert.match(rejected({}), /predates the session record/);
+    // Removed: the lane is already cleaned up.
+    editManifest((manifest) => { manifest.cleanup = { status: "removed" }; });
+    assert.match(rejected({}), /already removed/);
+    // Mismatched: the reference disagrees with the recorded identity.
+    writeFileSync(manifestFile, original);
+    assert.match(
+      rejected({ reference: { ...reference, allocation: { ...reference.allocation, branch: "pi-subagents/other" } } }),
+      /does not match the reference/,
+    );
+
+    // Missing: no evidence to verify the association at all.
+    rmSync(manifestFile, { force: true });
+    assert.match(rejected({}), /no lane manifest/);
+
+    // Duplicate: two lanes claim one session, so neither can be resumed.
+    writeFileSync(manifestFile, original);
+    laneWithSession("resume003", sessionFile);
+    assert.match(rejected({}), /ambiguous/);
+
+    // Refusing never touches the lane it refused.
+    assert.equal(existsSync(worktree), true);
+    assert.equal(git(["symbolic-ref", "--short", "HEAD"], worktree).trim(), reference.allocation.branch);
+    assert.equal(readFileSync(manifestFile, "utf8"), original);
+  });
+
+  it("rejects a lane whose worktree is gone or checked out on another branch", () => {
+    const gone = laneWithSession("resume004", join(sandbox, "resume-gone.jsonl"));
+    rmSync(gone.entry.manifest.worktree, { recursive: true, force: true });
+    const goneResult = validateLaneResume({
+      reference: gone.reference,
+      sessionPath: gone.reference.sessionFile,
+      cwd: gone.entry.manifest.worktree,
+    });
+    assert.equal(goneResult.ok, false);
+    assert.match(goneResult.ok ? "" : goneResult.error, /worktree is gone/);
+
+    const switched = laneWithSession("resume005", join(sandbox, "resume-switched.jsonl"));
+    git(["checkout", "-q", "-b", "someone-elses-branch"], switched.entry.manifest.worktree);
+    const switchedResult = validateLaneResume({
+      reference: switched.reference,
+      sessionPath: switched.reference.sessionFile,
+      cwd: switched.entry.manifest.worktree,
+    });
+    assert.equal(switchedResult.ok, false);
+    assert.match(switchedResult.ok ? "" : switchedResult.error, /registered on branch/);
+  });
+
+  it("ignores lane evidence whose recorded worktree is not absolute", () => {
+    const { entry } = laneWithSession("resume006", join(sandbox, "resume-relative.jsonl"));
+    const manifest: any = JSON.parse(readFileSync(entry.manifestFile, "utf8"));
+    manifest.worktree = "pi-worktree-relative";
+    writeFileSync(entry.manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    // Without the absolute-path gate this relative value resolves against the
+    // test runner's cwd and claims it as a lane worktree.
+    const falseClaim = join(process.cwd(), "pi-worktree-relative", "packages", "app");
+    assert.deepEqual(lanesContaining(artifactDir, falseClaim), []);
+
+    // The gate rejects only the malformed entry: absolute evidence still matches.
+    const absolute = laneWithSession("resume007", join(sandbox, "resume-absolute.jsonl"));
+    const matched = lanesContaining(artifactDir, join(absolute.entry.manifest.worktree, "packages", "app"));
+    assert.deepEqual(matched.map((lane) => lane.manifest.laneId), ["resume007"]);
   });
 });

@@ -1,6 +1,7 @@
 import type { AgentDefinition } from "../agent-definition.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
+import type { LaneReference } from "../worktree.ts";
 
 export interface SubagentLaunchParams {
   id: string;
@@ -44,6 +45,8 @@ export interface SubagentLaunchContext {
   summaryInstruction?: string;
   subagentsDir: string;
   shellQuote: (s: string) => string;
+  /** Durable lane reference to persist in the launch profile when this run owns one. */
+  lane?: LaneReference;
 }
 
 export interface BuiltHarnessCommand {

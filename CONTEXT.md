@@ -89,7 +89,7 @@ _Avoid_: sidebar, status bar, HUD.
 ### Isolation and handoff
 
 **Lane**:
-An isolated git worktree, on its own branch, in which one run does its work.
+An isolated git worktree, on its own branch, that one session owns across resumes.
 _Avoid_: sandbox, worktree, checkout.
 
 **Handoff**:

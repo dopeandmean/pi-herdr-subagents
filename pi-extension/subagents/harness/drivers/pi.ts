@@ -8,6 +8,7 @@ import type {
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { SENTINEL_TRAILER } from "../../handoff.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
+import type { LaneReference } from "../../worktree.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -32,6 +33,27 @@ export interface PiLaunchProfile {
   args: string[];
   env: Record<string, string>;
   cwd: string | null;
+  /** Durable lane reference, present when this session was launched into a lane. */
+  lane?: LaneReference;
+}
+
+function isProfileString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isValidLaneReference(lane: any): boolean {
+  const allocation = lane?.allocation;
+  return (
+    isProfileString(lane?.laneId) &&
+    isProfileString(lane?.artifactDir) &&
+    isProfileString(lane?.sessionFile) &&
+    !!allocation &&
+    typeof allocation === "object" &&
+    !Array.isArray(allocation) &&
+    (["repoRoot", "branch", "path", "baseRef", "baseCommit"] as const).every((field) =>
+      isProfileString(allocation[field]),
+    )
+  );
 }
 
 export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null {
@@ -49,6 +71,9 @@ export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null
       !Object.entries(profile.env).every(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === "string") ||
       !(profile.cwd === null || typeof profile.cwd === "string")) {
     throw new Error(`Invalid Pi launch profile: ${path}`);
+  }
+  if (profile.lane !== undefined && !isValidLaneReference(profile.lane)) {
+    throw new Error(`Invalid Pi launch profile: ${path} (lane reference)`);
   }
   return profile;
 }
@@ -155,8 +180,13 @@ export class PiHarnessDriver implements HarnessDriver {
     if (ponytail) env.PONYTAIL_DEFAULT_MODE = ponytail;
     env.PI_SUBAGENT_AGENT = params.agent ?? "";
 
-    // Preserve the role, tools, skills, mode and cwd on subagent_resume.
-    const profile: PiLaunchProfile = { args: parts, env, cwd: effectiveCwd ?? process.cwd() };
+    // Preserve the role, tools, skills, mode, cwd and lane ownership on subagent_resume.
+    const profile: PiLaunchProfile = {
+      args: parts,
+      env,
+      cwd: effectiveCwd ?? process.cwd(),
+      ...(context.lane ? { lane: context.lane } : {}),
+    };
     mkdirSync(dirname(subagentSessionFile), { recursive: true });
     writeFileSync(`${subagentSessionFile}.launch.json`, JSON.stringify(profile), "utf8");
 

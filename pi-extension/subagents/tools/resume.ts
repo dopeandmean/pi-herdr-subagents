@@ -1,12 +1,13 @@
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
-import { contextArtifactName, formatPiLaunch, readPiLaunchProfile } from "../harness/drivers/pi.ts";
+import { contextArtifactName, formatPiLaunch, readPiLaunchProfile, type PiLaunchProfile } from "../harness/drivers/pi.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
 import { createSubagentPane, isTerminalAvailable, runScriptInPane, setPaneTask, shellQuote } from "../herdr.ts";
 import { createLifecycle } from "../lifecycle.ts";
 import { type RunningSubagent, getArtifactDir, getShellReadyDelayMs, muxUnavailableResult, resolveResumeLaunchBehavior, runningSubagents, startStatusRefresh, startWidgetRefresh, superviseRun } from "../run.ts";
 import { findLastAssistantMessage, getNewEntries } from "../session.ts";
+import { lanesContaining, lanesForSession, validateLaneResume } from "../worktree.ts";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -40,6 +41,84 @@ const ResumeParams = Type.Object({
 
 /** Absolute path to `pi-extension/subagents`. */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url)).replace(/\/tools$/, "");
+
+type LaneAttachment = NonNullable<RunningSubagent["worktree"]>;
+
+/**
+ * Re-attach a resumed session to the one lane it owns, or explain why the
+ * resume must not proceed. The lane reference is durable session evidence —
+ * never a guess from the session's label or cwd — and every failure keeps the
+ * lane, its branch, its worktree and its manifest untouched.
+ */
+function resolveLaneAttachment(options: {
+  profile: PiLaunchProfile | null;
+  sessionPath: string;
+  artifactDir: string;
+}): { ok: true; lane?: LaneAttachment } | { ok: false; error: string } {
+  const reference = options.profile?.lane;
+  if (reference) {
+    const validated = validateLaneResume({
+      reference,
+      sessionPath: options.sessionPath,
+      cwd: options.profile?.cwd ?? null,
+    });
+    return validated.ok
+      ? {
+          ok: true,
+          lane: {
+            allocation: validated.allocation,
+            artifactDir: reference.artifactDir,
+            laneId: reference.laneId,
+          },
+        }
+      : validated;
+  }
+
+  // Lane evidence without a usable reference — an older profile, or a resume
+  // after the reference was lost — cannot be verified: guessing which lane the
+  // session owns would let a follow-up edit a lane it does not own.
+  const recorded = lanesForSession(options.artifactDir, options.sessionPath);
+  if (recorded.length > 0) {
+    return {
+      ok: false,
+      error:
+        `lane ${recorded.map((entry) => entry.manifest.laneId).join(", ")} records this session but the launch profile carries no lane reference` +
+        (recorded.length > 1 ? " (multiple lanes recorded for one session)" : ""),
+    };
+  }
+
+  // No evidence names this session, but a pre-reference profile may still have
+  // been launched inside a lane. Resuming there would edit a lane nothing
+  // recaptures, so refuse instead of guessing ownership from the cwd.
+  const cwd = options.profile?.cwd ?? null;
+  const inside = lanesContaining(options.artifactDir, cwd);
+  if (inside.length > 0) {
+    return {
+      ok: false,
+      error:
+        `the recorded cwd ${cwd} is inside lane worktree ${inside
+          .map((entry) => entry.manifest.worktree)
+          .join(", ")}, but the launch profile carries no lane reference proving this session owns it` +
+        (inside.length > 1 ? " (multiple lanes contain it)" : ""),
+    };
+  }
+  return { ok: true };
+}
+
+/** Rejecting a resume never creates side effects: no pane, no cleanup. */
+function laneRejection(name: string, sessionPath: string, error: string) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Error: refusing to resume "${name}": ${error}. No pane was opened; the lane's ` +
+          "worktree, branch, manifest and patch were left untouched.",
+      },
+    ],
+    details: { error, name, sessionPath, status: "rejected" as const },
+  };
+}
 
 export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams> {
   return {
@@ -99,7 +178,26 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     // Record entry count before resuming so we can extract new messages
     const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-    const profile = readPiLaunchProfile(params.sessionPath);
+    const sessionId = ctx.sessionManager.getSessionId();
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+
+    // Resolve lane ownership before anything is launched: a rejected
+    // association must not open a pane or touch the lane's evidence.
+    let profile: PiLaunchProfile | null = null;
+    let lane: LaneAttachment | undefined;
+    try {
+      profile = readPiLaunchProfile(params.sessionPath);
+      const attachment = resolveLaneAttachment({
+        profile,
+        sessionPath: params.sessionPath,
+        artifactDir,
+      });
+      if (!attachment.ok) return laneRejection(name, params.sessionPath, attachment.error);
+      lane = attachment.lane;
+    } catch (error: any) {
+      return laneRejection(name, params.sessionPath, error?.message ?? String(error));
+    }
+
     const surface = createSubagentPane(name);
     if (params.message) {
       setPaneTask(surface, params.message);
@@ -113,8 +211,6 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
     if (!profile) parts.push("-e", subagentDonePath);
 
-    const sessionId = ctx.sessionManager.getSessionId();
-    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
 
@@ -157,11 +253,14 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
       ].join("\n"),
     });
 
-    // Register as a running subagent for widget tracking
+    // Register as a running subagent for widget tracking. The resumed run keeps
+    // its own id; the lane it works in is the one the session already owns.
+    const resumedAgent = profile?.env?.PI_SUBAGENT_AGENT?.trim() || undefined;
     const running: RunningSubagent = {
       id,
       name,
       task: params.message ?? "resumed session",
+      ...(resumedAgent ? { agent: resumedAgent } : {}),
       surface,
       startTime,
       sessionFile: params.sessionPath,
@@ -169,6 +268,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
       activityFile,
       interactive,
       runtimePlan: undefined,
+      ...(lane ? { worktree: lane } : {}),
       lifecycle: createLifecycle(startTime),
     };
     runningSubagents.set(id, running);
