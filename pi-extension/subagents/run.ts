@@ -10,7 +10,7 @@ import { type SubagentLaunchParams } from "./params.ts";
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-import { getDefaultSessionDirFor, loadAgentDefaults, resolveDenyTools, resolveEffectiveAutoExit, resolveEffectiveInteractive, resolveLaunchBehavior, resolveSubagentPaths } from "./discovery.ts";
+import { getDefaultSessionDirFor, resolveAgentDefinition, resolveDenyTools, resolveEffectiveAutoExit, resolveEffectiveInteractive, resolveLaunchBehavior, resolveSubagentPaths } from "./discovery.ts";
 import { getHarnessDriver } from "./harness/index.ts";
 import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 import { findLastAssistantMessage, findObservedSessionRuntime, getNewEntries, seedSubagentSessionFile } from "./session.ts";
@@ -664,7 +664,10 @@ export async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  // Resolve the explicit role before anything is allocated (pane, session,
+  // worktree, artifacts): an unknown name must fail, a bare call stays bare.
+  const { defs: agentDefs, error: agentError } = resolveAgentDefinition(params.agent);
+  if (agentError) throw new Error(agentError);
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },

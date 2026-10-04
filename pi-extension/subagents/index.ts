@@ -8,7 +8,7 @@ import { join } from "node:path";
 import {
   buildAvailableAgentCatalog,
   discoverAgentDefinitions,
-  loadAgentDefaults,
+  resolveAgentDefinition,
 } from "./discovery.ts";
 import { buildSubagentRoutingGuidelines, setRoutingGuidelines } from "./guidelines.ts";
 import { loadModelConfig } from "./model-config.ts";
@@ -94,12 +94,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
-      if (!defs) {
-        ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
-          "error",
-        );
+      // Reject unknown roles here for immediate feedback; the launch path enforces the same rule.
+      const { error } = resolveAgentDefinition(agentName);
+      if (error) {
+        ctx.ui.notify(error, "error");
         return;
       }
 

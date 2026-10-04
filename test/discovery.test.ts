@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { createMockExtensionApi, testApi, withIsolatedAgentEnv, writeAgentFile } from "./helpers.ts";
@@ -546,3 +546,143 @@ describe("subagent discovery", () => {
     assert.match(withOverride, /model anthropic\/test-config-model/);
   });
 });
+
+/**
+ * Explicit role resolution happens before any allocation. A context that throws
+ * on first property access stands in for the session, pane and worktree
+ * machinery: if a launch reads the context, it also already allocated.
+ */
+const LAUNCH_CONTEXT_TOUCHED = "launch touched the context";
+
+function poisonedLaunchContext(): any {
+  return new Proxy(
+    {},
+    {
+      get() {
+        throw new Error(LAUNCH_CONTEXT_TOUCHED);
+      },
+    },
+  );
+}
+
+describe("explicit agent role resolution", () => {
+  it("rejects an unknown agent name before the launch touches anything", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalDir }) => {
+      writeAgentFile(projectAgentsDir, "known-role-test-agent", [
+        "name: known-role-test-agent",
+        "model: fake/known-role-model",
+      ].join("\n"));
+
+      await assert.rejects(
+        () =>
+          testApi.launchSubagent(
+            { name: "Ghost", task: "T", agent: "ghost-role-test-agent" },
+            poisonedLaunchContext(),
+            "off",
+          ),
+        (error: Error) => {
+          assert.match(error.message, /Unknown agent "ghost-role-test-agent"/);
+          assert.match(
+            error.message,
+            /known-role-test-agent/,
+            "the error must list the available agent names",
+          );
+          return true;
+        },
+      );
+      assert.ok(
+        !existsSync(join(globalDir, "sessions")),
+        "a rejected launch must not create the subagent session directory",
+      );
+    });
+  });
+
+  it("resolves a known agent name and its defaults instead of rejecting it", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "known-role-test-agent",
+        [
+          "name: known-role-test-agent",
+          "model: fake/known-role-model",
+          "thinking: high",
+          "session-mode: lineage-only",
+          "auto-exit: true",
+        ].join("\n"),
+        "You are the known test role.",
+      );
+
+      const { defs, error } = testApi.resolveAgentDefinition("known-role-test-agent");
+      assert.equal(error, null);
+      assert.ok(defs, "a known name must resolve to its definition");
+      assert.equal(defs.model, "fake/known-role-model");
+      assert.equal(defs.body, "You are the known test role.");
+      assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, defs), "lineage-only");
+      assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, defs), true);
+
+      // The launch path accepts the same name: it resolves the role and moves
+      // on to the parent model instead of reporting an unknown agent.
+      await assert.rejects(
+        () =>
+          testApi.launchSubagent(
+            { name: "Known", task: "T", agent: "known-role-test-agent" },
+            poisonedLaunchContext(),
+            "off",
+          ),
+        (error: Error) => {
+          assert.match(error.message, new RegExp(LAUNCH_CONTEXT_TOUCHED));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("keeps a bare launch bare: no role defaults and the autonomous profile", async () => {
+    const { defs, error } = testApi.resolveAgentDefinition(undefined);
+    assert.equal(defs, null);
+    assert.equal(error, null);
+
+    const bare = { name: "Bare", task: "T" };
+    assert.equal(testApi.resolveEffectiveSessionMode(bare, null), "standalone");
+    assert.equal(testApi.resolveEffectiveAutoExit(bare, null), true);
+    assert.equal(testApi.resolveEffectiveInteractive(bare, null), false);
+
+    // A bare call reaches the launch context (no role resolution error).
+    await assert.rejects(
+      () => testApi.launchSubagent(bare, poisonedLaunchContext(), "off"),
+      new RegExp(LAUNCH_CONTEXT_TOUCHED),
+    );
+  });
+});
+
+describe("/subagent unknown role feedback", () => {
+  it("notifies the available names and emits no tool call", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "known-role-test-agent", [
+        "name: known-role-test-agent",
+        "model: fake/known-role-model",
+      ].join("\n"));
+
+      const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const command = registeredCommands.find((entry) => entry.name === "subagent");
+      assert.ok(command, "expected /subagent to be registered");
+
+      const notifications: Array<{ message: string; level: string }> = [];
+      command.handler("ghost-role-test-agent do something", {
+        ui: {
+          notify(message: string, level: string) {
+            notifications.push({ message, level });
+          },
+        },
+      });
+
+      assert.equal(sentUserMessages.length, 0, "an unknown role must not reach the tool");
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0].level, "error");
+      assert.match(notifications[0].message, /Unknown agent "ghost-role-test-agent"/);
+      assert.match(notifications[0].message, /known-role-test-agent/);
+    });
+  });
+});
+

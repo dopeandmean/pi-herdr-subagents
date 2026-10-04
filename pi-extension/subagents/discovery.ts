@@ -288,3 +288,26 @@ export function loadAgentDefaults(agentName: string): DiscoveredAgent | null {
   // differs from its filename.
   return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
 }
+
+/**
+ * Resolve an explicitly requested role name, or why it cannot be launched.
+ *
+ * An unknown name is an error, not a silent fallback to the bare profile: the
+ * bare spawn would drop that role's prompt, tools, model and session mode.
+ */
+export function resolveAgentDefinition(agentName: string | undefined): {
+  defs: DiscoveredAgent | null;
+  error: string | null;
+} {
+  if (!agentName) return { defs: null, error: null };
+  const defs = loadAgentDefaults(agentName);
+  if (defs) return { defs, error: null };
+  const available = discoverAgentDefinitions()
+    .filter((agent) => !agent.disableModelInvocation)
+    .map((agent) => agent.name)
+    .sort();
+  return {
+    defs: null,
+    error: `Unknown agent "${agentName}". Available agents: ${available.join(", ") || "none discovered"}`,
+  };
+}
