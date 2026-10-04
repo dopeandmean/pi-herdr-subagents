@@ -1,7 +1,7 @@
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync } from "node:fs";
-import { terminalSetupHint, createSubagentPane, runScriptInPane, closePane, interruptPane, shellQuote, readPane, readPaneAsync, inspectPane, setPaneTask } from "./herdr.ts";
+import { terminalSetupHint, createSubagentPane, runScriptInPane, closePane, interruptPane, shellQuote, readPane, readPaneAsync, inspectPane, paneRunLabel, setPaneTaskLabel } from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
 import { renderSubagentWidgetLines } from "./widget.ts";
 import { isThinkingLevel, resolveRuntimePlan, wrapPiModelRegistry, type ResolvedRuntimePlan, type ThinkingLevel } from "./runtime-routing.ts";
@@ -819,7 +819,7 @@ export async function launchSubagent(
     const pane = options?.surface ?? createSubagentPane(params.name);
     surface = pane;
     if (params.task) {
-      setPaneTask(pane, params.task);
+      setPaneTaskLabel(pane, paneRunLabel(params.agent, params.name, id));
     }
     if (!surfacePreCreated) {
       await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));

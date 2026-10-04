@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
 import { contextArtifactName, formatPiLaunch, readPiLaunchProfile, type PiLaunchProfile } from "../harness/drivers/pi.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
-import { createSubagentPane, isTerminalAvailable, runScriptInPane, setPaneTask, shellQuote } from "../herdr.ts";
+import { createSubagentPane, isTerminalAvailable, paneRunLabel, runScriptInPane, setPaneTaskLabel, shellQuote } from "../herdr.ts";
 import { createLifecycle } from "../lifecycle.ts";
 import { type RunningSubagent, getArtifactDir, getShellReadyDelayMs, muxUnavailableResult, resolveResumeLaunchBehavior, runningSubagents, startStatusRefresh, startWidgetRefresh, superviseRun } from "../run.ts";
 import { findLastAssistantMessage, getNewEntries } from "../session.ts";
@@ -200,7 +200,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
 
     const surface = createSubagentPane(name);
     if (params.message) {
-      setPaneTask(surface, params.message);
+      setPaneTaskLabel(surface, paneRunLabel(profile?.env?.PI_SUBAGENT_AGENT, name, id));
     }
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 

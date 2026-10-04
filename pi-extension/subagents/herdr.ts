@@ -261,7 +261,7 @@ export function runScriptInPane(
   const scriptLines = ["#!/bin/bash"];
   if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
   scriptLines.push(command);
-  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
+  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o700 });
 
   runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
   return scriptPath;
@@ -359,12 +359,27 @@ export async function inspectPane(paneId: PaneId): Promise<PaneInspection> {
   return result;
 }
 
+/**
+ * Bounded operational label for a subagent pane's "task" metadata: the role,
+ * display name and run id that already identify this run. Pane metadata is a
+ * shared, human-visible surface outside the child session, so the task prompt
+ * itself is never reported. This bounds what is exported; it is not redaction
+ * for arbitrary secrets a task may carry.
+ */
+export function paneRunLabel(role: string | undefined, name: string, runId: string): string {
+  return [role && role !== name ? role : "", name, runId]
+    .map((field) => field.replace(/[\r\n\t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("/")
+    .slice(0, 80);
+}
+
 function buildPaneReportTaskArgs(
   paneId: string,
-  task: string,
+  label: string,
   source = "pi",
 ): string[] {
-  const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
+  const normalizedLabel = label.replace(/[\r\n\t]+/g, " ").trim();
   return [
     "pane",
     "report-metadata",
@@ -372,15 +387,15 @@ function buildPaneReportTaskArgs(
     "--source",
     source,
     "--token",
-    `task=${normalizedTask}`,
+    `task=${normalizedLabel}`,
   ];
 }
 
-export function setPaneTask(paneId: PaneId, task: string): void {
+export function setPaneTaskLabel(paneId: PaneId, label: string): void {
   if (!isTerminalAvailable()) return;
-  if (!task.replace(/[\r\n\t]+/g, " ").trim()) return;
+  if (!label.replace(/[\r\n\t]+/g, " ").trim()) return;
   try {
-    herdrExec(buildPaneReportTaskArgs(paneId, task));
+    herdrExec(buildPaneReportTaskArgs(paneId, label));
   } catch {
     // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
   }

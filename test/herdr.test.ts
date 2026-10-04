@@ -1,6 +1,6 @@
-import { describe, it, after } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isTerminalAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { isTerminalAvailable, paneRunLabel, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
 describe("herdr.ts", () => {
   describe("isTerminalAvailable", () => {
@@ -58,9 +58,9 @@ describe("herdr.ts", () => {
       });
     });
 
-    it("constructs report-metadata arguments with normalized task token", () => {
+    it("constructs report-metadata arguments with the bounded label token", () => {
       assert.deepEqual(
-        __herdrTest__.buildPaneReportTaskArgs("pane-1", "Inspect failing test suite", "pi"),
+        __herdrTest__.buildPaneReportTaskArgs("pane-1", "meta-role/Meta Worker/ab12cd34", "pi"),
         [
           "pane",
           "report-metadata",
@@ -68,12 +68,12 @@ describe("herdr.ts", () => {
           "--source",
           "pi",
           "--token",
-          "task=Inspect failing test suite",
+          "task=meta-role/Meta Worker/ab12cd34",
         ],
       );
     });
 
-    it("flattens multi-line and tab-padded tasks into a single line", () => {
+    it("flattens multi-line and tab-padded labels into a single line", () => {
       assert.deepEqual(
         __herdrTest__.buildPaneReportTaskArgs(
           "pane-2",
@@ -90,6 +90,18 @@ describe("herdr.ts", () => {
           "task=Line 1 Line 2 Line 3",
         ],
       );
+    });
+
+    it("builds a bounded role/name/run label from existing identifiers", () => {
+      assert.equal(
+        paneRunLabel("meta-role", "Meta Worker", "ab12cd34"),
+        "meta-role/Meta Worker/ab12cd34",
+      );
+      // A bare call has no distinct role; the display name still identifies the run.
+      assert.equal(paneRunLabel(undefined, "Meta Worker", "ab12cd34"), "Meta Worker/ab12cd34");
+      assert.equal(paneRunLabel("Meta Worker", "Meta Worker", "ab12cd34"), "Meta Worker/ab12cd34");
+      // The label cannot grow pane metadata without bound.
+      assert.ok(paneRunLabel(undefined, "x".repeat(200), "id").length <= 80);
     });
   });
 

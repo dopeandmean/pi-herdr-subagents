@@ -1,7 +1,7 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getDefaultSessionDirFor } from "../pi-extension/subagents/discovery.ts";
@@ -740,6 +740,62 @@ describe("lane re-attachment on resume", () => {
       assert.match(readFileSync(logFile, "utf8"), /pane run/);
     } finally {
       process.env.FAKE_HERDR_DONE = "1";
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      stopTracking();
+    }
+  });
+});
+
+describe("pane metadata", () => {
+  it("reports a bounded role/name/run label instead of the task or resume message", async () => {
+    const sessionDir = join(sandbox, "meta-sessions");
+    const parentSessionFile = parentSession("meta-parent", [SESSION_HEADER, USER_MSG]);
+    writeAgentFile(join(agentDir, "agents"), "meta-role", "name: meta-role");
+    const secretTask = "SECRET-TASK-BODY plumb the private API keys";
+    const secretMessage = "SECRET-RESUME-BODY rotate the token";
+
+    try {
+      writeFileSync(logFile, "");
+      const launched = await launchSubagent(
+        { name: "Meta Worker", agent: "meta-role", task: secretTask },
+        launchContext({ sessionDir, parentSessionFile, cwd: sandbox }),
+        "medium",
+      );
+      const launchLog = readFileSync(logFile, "utf8");
+      assert.match(launchLog, /pane report-metadata/, "the pane metadata report is issued");
+      assert.doesNotMatch(launchLog, /SECRET-TASK-BODY/, "the task prompt never reaches pane metadata");
+      assert.match(
+        launchLog,
+        new RegExp(`task=meta-role/Meta Worker/${launched.id}(\\s|$)`),
+        `expected a bounded role/name/run label in: ${launchLog}`,
+      );
+      // The launch script the pane executes is readable only by its owner.
+      assert.equal(statSync(launched.launchScriptFile!).mode & 0o777, 0o700);
+
+      // The resume path reports its own bounded label, never the follow-up message.
+      const { api } = createMockExtensionApi();
+      const resume = createResumeTool(api);
+      const ctx = {
+        sessionManager: { getSessionId: () => "sess-launch", getSessionDir: () => sessionDir },
+      } as any;
+      writeFileSync(logFile, "");
+      const resumed: any = await resume.execute(
+        "call-1",
+        { sessionPath: parentSessionFile, name: "Meta Resume", message: secretMessage },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(resumed.details.status, "started");
+      const resumeLog = readFileSync(logFile, "utf8");
+      assert.doesNotMatch(resumeLog, /SECRET-RESUME-BODY/, "the resume message never reaches pane metadata");
+      assert.match(
+        resumeLog,
+        new RegExp(`task=Meta Resume/${resumed.details.id}(\\s|$)`),
+        `expected a bounded name/run label in: ${resumeLog}`,
+      );
+    } finally {
       cleanupSubagentsForShutdown("quit", runningSubagents);
       await new Promise((resolve) => setTimeout(resolve, 250));
       stopTracking();
