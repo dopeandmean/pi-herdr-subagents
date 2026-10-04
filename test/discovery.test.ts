@@ -194,6 +194,63 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("bundled role profiles keep codemode's underlying tools available", async () => {
+    await withIsolatedAgentEnv(() => {
+      const required: Record<string, string[]> = {
+        orchestrator: ["read", "bash", "write", "fffind", "ffgrep"],
+        "subagent-explorer": ["read", "fffind", "ffgrep"],
+        "subagent-worker": ["read", "bash", "edit", "write", "fffind", "ffgrep"],
+        "subagent-reviewer": ["read", "bash", "fffind", "ffgrep"],
+        "subagent-tester": ["read", "bash", "fffind", "ffgrep"],
+        "subagent-quality": ["read", "bash", "fffind", "ffgrep"],
+        "visual-tester": ["read", "bash", "write"],
+      };
+      const forbidden: Record<string, string[]> = {
+        "subagent-explorer": ["edit", "write"],
+        "subagent-reviewer": ["edit", "write"],
+        "subagent-tester": ["edit", "write"],
+        "subagent-quality": ["edit", "write"],
+      };
+      for (const [name, tools] of Object.entries(required)) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        const active = (defs.tools ?? "").split(",").map((t) => t.trim()).filter(Boolean);
+        assert.ok(active.includes("codemode"), `${name} must keep codemode active`);
+        for (const tool of forbidden[name] ?? []) {
+          assert.ok(!active.includes(tool), `${name} must stay no-authoring (no ${tool})`);
+        }
+        for (const tool of tools) {
+          assert.ok(active.includes(tool), `${name} must keep ${tool} active for codemode scripts`);
+        }
+      }
+    });
+  });
+
+  it("treats a blank frontmatter value as absent instead of reading the next line", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "blank-value-agent",
+        [
+          "name: blank-value-agent",
+          "model: deepseek/deepseek-flash",
+          "skills:",
+          "ponytail: off",
+        ].join("\n"),
+      );
+      const loaded = testApi.loadAgentDefaults("blank-value-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.skills, undefined);
+      assert.equal(loaded.ponytail, "off");
+      const orchestrator = testApi.loadAgentDefaults("orchestrator");
+      assert.ok(orchestrator, "expected bundled orchestrator to be discoverable");
+      assert.ok(
+        orchestrator.skills === undefined || orchestrator.skills === "none",
+        `orchestrator skills must be absent or none, got ${JSON.stringify(orchestrator.skills)}`,
+      );
+    });
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(

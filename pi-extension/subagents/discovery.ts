@@ -68,9 +68,11 @@ function getBundledAgentsDir(): string {
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  // [ \t]* keeps a blank value on its own line instead of consuming the next frontmatter key.
+  const match = frontmatter.match(new RegExp(`^${key}:[ \\t]*(.*)$`, "m"));
   if (!match) return undefined;
   const value = match[1].trim();
+  if (value === "") return undefined;
   if (
     value.length >= 2 &&
     ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))

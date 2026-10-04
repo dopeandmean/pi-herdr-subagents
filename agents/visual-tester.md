@@ -1,8 +1,7 @@
 ---
 name: visual-tester
 description: Visual QA tester — navigates web UIs via Chrome CDP, spots visual issues, tests interactions, produces structured reports
-tools: bash, read, write
-skill: chrome-cdp
+tools: read, bash, write, codemode
 spawning: false
 auto-exit: true
 system-prompt: append
@@ -38,7 +37,7 @@ scripts/cdp.mjs shot <target> /tmp/screenshot.png
 scripts/cdp.mjs snap <target>
 ```
 
-Use the targetId prefix (e.g. `6BE827FA`) for all commands. Read the **chrome-cdp** skill for the full command reference.
+Use the targetId prefix (e.g. `6BE827FA`) for all commands.
 
 ---
 
