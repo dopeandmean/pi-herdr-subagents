@@ -494,6 +494,131 @@ function registeredWorktrees(repoRoot: string): Map<string, string> {
   return map;
 }
 
+function changedLaneEvidenceBlockers(manifest: HandoffManifest): string[] {
+  const blockers: string[] = [];
+
+  // Fresh lineage first: manifest counters are evidence, not authority, so
+  // stale or altered "empty" metadata cannot authorize removing a lane whose
+  // recorded base..head range actually holds commits.
+  const baseCommit = tryGit(
+    ["rev-parse", "--verify", `${manifest.baseCommit}^{commit}`],
+    { cwd: manifest.repoRoot },
+  )?.trim();
+  const headCommit = tryGit(
+    ["rev-parse", "--verify", `${manifest.headCommit}^{commit}`],
+    { cwd: manifest.repoRoot },
+  )?.trim();
+  if (!baseCommit || !headCommit ||
+      tryGit(["merge-base", "--is-ancestor", baseCommit, headCommit], {
+        cwd: manifest.repoRoot,
+      }) === null) {
+    blockers.push("lane base and captured head do not have verifiable lineage");
+    return blockers;
+  }
+  const commits = tryGit(["rev-list", "--reverse", `${baseCommit}..${headCommit}`], {
+    cwd: manifest.repoRoot,
+  });
+  if (commits === null) {
+    blockers.push("lane child commits cannot be resolved");
+    return blockers;
+  }
+  const laneCommits = commits.trim() ? commits.trim().split("\n") : [];
+  if (laneCommits.length !== manifest.childCommits) {
+    blockers.push("captured lane child commit count does not match its lineage");
+  }
+  // The patch file on disk is fresh evidence too: an altered "no changes"
+  // manifest must not clear a patch-only lane.
+  let capturedPatchBytes = 0;
+  try {
+    capturedPatchBytes = statSync(manifest.patchFile).size;
+  } catch {
+    capturedPatchBytes = -1;
+  }
+  if (laneCommits.length === 0 && manifest.changedPaths.length === 0 && capturedPatchBytes === 0) {
+    return blockers;
+  }
+
+  const review = manifest.review;
+  if (!review) {
+    blockers.push("review evidence missing for changed lane");
+  } else {
+    if (review.verdict !== "OK" && review.verdict !== "OK with notes") {
+      blockers.push(`review verdict ${review.verdict} does not authorize cleanup`);
+    }
+    if (review.headCommit !== manifest.headCommit) {
+      blockers.push("review is stale for the captured head");
+    }
+  }
+
+  const merge = manifest.merge;
+  if (!merge) {
+    blockers.push("integration evidence missing for changed lane");
+    return blockers;
+  }
+  if (merge.reviewedHead !== manifest.headCommit) {
+    blockers.push("integration evidence does not match the reviewed head");
+  }
+
+  const integrationCommit = tryGit(
+    ["rev-parse", "--verify", `${merge.commit}^{commit}`],
+    { cwd: manifest.repoRoot },
+  )?.trim();
+  if (!integrationCommit) {
+    blockers.push("integration commit does not resolve");
+    return blockers;
+  }
+  if (integrationCommit !== merge.commit) {
+    blockers.push("integration evidence must name an immutable commit");
+  }
+
+  const repoHead = tryGit(["rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: manifest.repoRoot,
+  })?.trim();
+  if (!repoHead || tryGit(["merge-base", "--is-ancestor", integrationCommit, repoHead], {
+    cwd: manifest.repoRoot,
+  }) === null) {
+    blockers.push("integration commit is not in the repository HEAD history");
+  }
+
+  if (laneCommits.length === 0) {
+    blockers.push("changed lane has no child commits; patch-only changes cannot prove integration");
+    return blockers;
+  }
+
+  const integrationHistory = tryGit(["rev-list", integrationCommit], {
+    cwd: manifest.repoRoot,
+  });
+  if (integrationHistory === null) {
+    blockers.push("integration commit history cannot be resolved");
+  } else {
+    const integrated = new Set(integrationHistory.trim().split("\n"));
+    if (laneCommits.some((commit) => !integrated.has(commit))) {
+      blockers.push("integration commit does not contain lane commits");
+    }
+  }
+
+  const committedPatch = tryGit(
+    [
+      "-c", "diff.noprefix=false",
+      "-c", "diff.mnemonicPrefix=false",
+      "diff", "--binary", "--find-renames", "--no-color", "--no-ext-diff", "--no-textconv",
+      baseCommit, headCommit,
+    ],
+    { cwd: manifest.repoRoot },
+  );
+  let capturedPatch: string | undefined;
+  try {
+    capturedPatch = readFileSync(manifest.patchFile, "utf8");
+  } catch {
+    // The missing or unreadable patch is reported below.
+  }
+  if (committedPatch === null || capturedPatch === undefined || committedPatch !== capturedPatch) {
+    blockers.push("captured patch contains changes without verifiable commit lineage");
+  }
+
+  return blockers;
+}
+
 /**
  * Read-only verdict on whether a lane may be removed. Runs fresh Git checks
  * every time — the manifest is evidence, never authority.
@@ -583,6 +708,19 @@ export function inspectLane(entry: LaneEntry): LaneInspection {
     if (leftover.length > 0) blockers.push(`worktree is dirty (${leftover.length} entries)`);
   }
 
+  // Every lane is scanned, empty or not: an ignored file is uncaptured work
+  // that a "no changes" manifest must not turn into force-removed data.
+  const ignored = tryGit(
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    { cwd: manifest.worktree },
+  );
+  if (ignored === null) {
+    blockers.push("ignored files could not be inspected");
+  } else if (ignored.split("\0").some((path) => path && !isRuntimeNoise(path))) {
+    blockers.push("worktree contains ignored files not covered by the captured patch");
+  }
+
+  blockers.push(...changedLaneEvidenceBlockers(manifest));
   inspection.removable = blockers.length === 0;
   return inspection;
 }
@@ -656,6 +794,17 @@ export function recordLaneEvidence(
   if (!manifest.capture?.ok) {
     return { ok: false, error: "lane handoff capture failed; nothing can be attested" };
   }
+  if (evidence.review &&
+      evidence.review.verdict !== "OK" &&
+      evidence.review.verdict !== "OK with notes") {
+    return { ok: false, error: `review verdict ${evidence.review.verdict} does not authorize cleanup` };
+  }
+  if (evidence.review || evidence.merge) {
+    const currentHead = tryGit(["rev-parse", "HEAD"], { cwd: manifest.worktree })?.trim();
+    if (currentHead !== manifest.headCommit) {
+      return { ok: false, error: "lane head moved since capture; fresh evidence is required" };
+    }
+  }
 
   const updated: HandoffManifest = { ...manifest };
   if (evidence.review) {
@@ -666,9 +815,8 @@ export function recordLaneEvidence(
     };
   }
   if (evidence.merge) {
-    const reviewedHead = manifest.review?.headCommit ?? manifest.headCommit;
-    if (manifest.review && manifest.review.headCommit !== manifest.headCommit) {
-      return { ok: false, error: "lane head moved after review; re-review before recording a merge" };
+    if (manifest.childCommits === 0) {
+      return { ok: false, error: "lane has no child commits; integration cannot be verified" };
     }
     const resolved = tryGit(["rev-parse", "--verify", `${evidence.merge.commit}^{commit}`], {
       cwd: manifest.repoRoot,
@@ -679,10 +827,12 @@ export function recordLaneEvidence(
     updated.merge = {
       commit: resolved,
       attestor: evidence.merge.attestor,
-      reviewedHead,
+      reviewedHead: updated.review?.headCommit ?? manifest.headCommit,
       ...(evidence.merge.postMergeChecks ? { postMergeChecks: evidence.merge.postMergeChecks } : {}),
       at: new Date().toISOString(),
     };
+    const blockers = changedLaneEvidenceBlockers(updated);
+    if (blockers.length > 0) return { ok: false, error: blockers.join("; ") };
   }
 
   writeManifestFile(manifestFile, updated);

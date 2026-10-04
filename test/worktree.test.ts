@@ -46,6 +46,20 @@ function lane(id: string, label = "worker"): LaneEntry {
   });
 }
 
+function changedLane(id: string): LaneEntry {
+  const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+  writeFileSync(join(allocation.path, "app.txt"), `lane change ${id}\n`);
+  git(["add", "-A"], allocation.path);
+  git(["commit", "-q", "-m", "lane change"], allocation.path);
+  return captureHandoff({
+    allocation,
+    laneId: id,
+    artifactDir,
+    name: "worker",
+    terminalState: { status: "completed", exitCode: 0 },
+  });
+}
+
 function laneEntry(id: string): LaneEntry {
   const entry = listLanes(artifactDir, id)[0];
   assert.ok(entry, `expected lane ${id} to be recorded`);
@@ -106,7 +120,6 @@ describe("worktree preflight", () => {
       const allocation = allocateWorktree({ cwd: noisy, label: "worker", laneId });
       mkdirSync(join(allocation.path, ".pi-lens-probe-home"), { recursive: true });
       writeFileSync(join(allocation.path, ".pi-lens-probe-home", "bus-events.log"), "noise\n");
-      writeFileSync(join(allocation.path, "real-work.txt"), "work\n");
 
       const entry = captureHandoff({
         allocation,
@@ -115,12 +128,11 @@ describe("worktree preflight", () => {
         name: "worker",
         terminalState: { status: "completed", exitCode: 0 },
       });
-      assert.deepEqual(entry.manifest.changedPaths.map((change) => change.path), ["real-work.txt"]);
+      assert.deepEqual(entry.manifest.changedPaths, []);
       assert.deepEqual(entry.manifest.excludedRuntimePaths, [".pi-lens-probe-home/bus-events.log"]);
       assert.doesNotMatch(readFileSync(entry.manifest.patchFile, "utf8"), /pi-lens-probe-home/);
 
       // Noise left behind by tooling must not block cleanup either.
-      rmSync(join(allocation.path, "real-work.txt"), { force: true });
       const removed = removeLane(entry);
       assert.equal(removed.removed, true, removed.reason);
     } finally {
@@ -291,34 +303,296 @@ describe("cleanup and evidence", () => {
     assert.equal(listLanes(artifactDir).some((lane) => lane.manifest.laneId === id), false);
   });
 
-  it("ties review and merge evidence to the captured head", () => {
-    const entry = lane(id);
+  it("preserves a clean changed lane without review or integration evidence", () => {
+    const entry = changedLane(id);
+
+    const inspection = inspectLane(entry);
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /review/);
+
+    const result = removeLane(entry);
+    assert.equal(result.removed, false);
+    assert.match(result.reason ?? "", /review/);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(
+      git(["show-ref", "--verify", `refs/heads/${entry.manifest.branch}`], repo).includes(
+        entry.manifest.branch,
+      ),
+      true,
+    );
+  });
+
+  it("rejects BLOCK and unrelated commits as changed-lane cleanup evidence", () => {
+    const entry = changedLane(id);
 
     const blocked = recordLaneEvidence(entry, {
       review: { verdict: "BLOCK", reviewer: "reviewer", notes: "unsafe retry loop" },
     });
-    assert.equal(blocked.ok, true);
-    const reviewed = laneEntry(id).manifest;
-    assert.equal(reviewed.review?.verdict, "BLOCK");
-    assert.equal(reviewed.review?.headCommit, entry.manifest.headCommit);
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error ?? "", /BLOCK/);
+    assert.equal(laneEntry(id).manifest.review, undefined);
 
-    const bogus = recordLaneEvidence(entry, {
-      merge: { commit: "cafe1234", attestor: "parent" },
+    const reviewed = recordLaneEvidence(entry, {
+      review: { verdict: "OK", reviewer: "reviewer" },
     });
-    assert.equal(bogus.ok, false);
-    assert.match(bogus.error ?? "", /does not resolve/);
+    assert.equal(reviewed.ok, true);
+    assert.equal(reviewed.manifest?.review?.headCommit, entry.manifest.headCommit);
 
-    git(["commit", "-q", "--allow-empty", "-m", "merge lane"], repo);
+    git(["commit", "-q", "--allow-empty", "-m", "unrelated commit"], repo);
+    const unrelatedCommit = git(["rev-parse", "HEAD"], repo).trim();
+    const unrelated = recordLaneEvidence(entry, {
+      merge: { commit: unrelatedCommit, attestor: "parent" },
+    });
+    assert.equal(unrelated.ok, false);
+    assert.match(unrelated.error ?? "", /lane commits/);
+    assert.equal(inspectLane(laneEntry(id)).removable, false);
+  });
+
+  it("rejects stale reviews after the captured lane head moves", () => {
+    const entry = changedLane(id);
+    assert.equal(
+      recordLaneEvidence(entry, {
+        review: { verdict: "OK", reviewer: "reviewer" },
+      }).ok,
+      true,
+    );
+
+    writeFileSync(join(entry.manifest.worktree, "later.txt"), "later lane work\n");
+    git(["add", "-A"], entry.manifest.worktree);
+    git(["commit", "-q", "-m", "later lane work"], entry.manifest.worktree);
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
+    const integrationCommit = git(["rev-parse", "HEAD"], repo).trim();
+
+    const stale = recordLaneEvidence(laneEntry(id), {
+      merge: { commit: integrationCommit, attestor: "parent" },
+    });
+    assert.equal(stale.ok, false);
+    assert.match(stale.error ?? "", /head moved/);
+    assert.equal(inspectLane(laneEntry(id)).removable, false);
+  });
+
+  it("preserves patch-only changes without verifiable commit lineage", () => {
+    const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+    writeFileSync(join(allocation.path, "app.txt"), "patch-only change\n");
+    const entry = captureHandoff({
+      allocation,
+      laneId: id,
+      artifactDir,
+      name: "worker",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+    assert.equal(entry.manifest.childCommits, 0);
+    assert.ok(entry.manifest.changedPaths.length > 0);
+
+    git(["checkout", "--", "."], allocation.path);
+    assert.equal(
+      recordLaneEvidence(entry, {
+        review: { verdict: "OK with notes", reviewer: "reviewer" },
+      }).ok,
+      true,
+    );
+    git(["commit", "-q", "--allow-empty", "-m", "unrelated patch commit"], repo);
+    const unrelatedCommit = git(["rev-parse", "HEAD"], repo).trim();
+
+    const integration = recordLaneEvidence(entry, {
+      merge: { commit: unrelatedCommit, attestor: "parent" },
+    });
+    assert.equal(integration.ok, false);
+    assert.match(integration.error ?? "", /child commits/);
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.ok(existsSync(entry.manifest.patchFile));
+  });
+
+  it("does not let an altered empty manifest clear a patch-only lane", () => {
+    const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+    writeFileSync(join(allocation.path, "app.txt"), `patch-only ${id}\n`);
+    const entry = captureHandoff({
+      allocation,
+      laneId: id,
+      artifactDir,
+      name: "worker",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+    assert.ok(entry.manifest.patchBytes > 0);
+    git(["checkout", "--", "app.txt"], allocation.path);
+    const persisted = JSON.parse(readFileSync(entry.manifestFile, "utf8"));
+    persisted.childCommits = 0;
+    persisted.changedPaths = [];
+    writeFileSync(entry.manifestFile, `${JSON.stringify(persisted, null, 2)}\n`);
+
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /review evidence missing for changed lane/);
+
+    const removed = removeLane(laneEntry(id));
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(existsSync(entry.manifest.patchFile), true);
+  });
+
+  it("preserves captured changes not represented by the lane commit history", () => {
+    const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+    writeFileSync(join(allocation.path, "app.txt"), `committed ${id}\n`);
+    git(["add", "-A"], allocation.path);
+    git(["commit", "-q", "-m", "lane commit"], allocation.path);
+    writeFileSync(join(allocation.path, "app.txt"), `captured but uncommitted ${id}\n`);
+    const entry = captureHandoff({
+      allocation,
+      laneId: id,
+      artifactDir,
+      name: "worker",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+    git(["checkout", "--", "app.txt"], allocation.path);
+    assert.equal(
+      recordLaneEvidence(entry, {
+        review: { verdict: "OK", reviewer: "reviewer" },
+      }).ok,
+      true,
+    );
+
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
+    const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
+    const merged = recordLaneEvidence(entry, {
+      merge: { commit: mergeCommit, attestor: "parent" },
+    });
+    assert.equal(merged.ok, false);
+    assert.match(merged.error ?? "", /captured patch/);
+    assert.equal(inspectLane(laneEntry(id)).removable, false);
+    assert.equal(existsSync(entry.manifest.patchFile), true);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+  });
+
+  it("preserves ignored data in a changed lane even after integration", () => {
+    const entry = changedLane(id);
+    assert.equal(
+      recordLaneEvidence(entry, {
+        review: { verdict: "OK", reviewer: "reviewer" },
+      }).ok,
+      true,
+    );
+
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
+    const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
+    assert.equal(
+      recordLaneEvidence(entry, {
+        merge: { commit: mergeCommit, attestor: "parent" },
+      }).ok,
+      true,
+    );
+
+    writeFileSync(join(repo, ".git", "info", "exclude"), "retained-ignored.txt\n");
+    writeFileSync(join(entry.manifest.worktree, "retained-ignored.txt"), "untracked data\n");
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /ignored files/);
+
+    const removed = removeLane(laneEntry(id));
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(existsSync(join(entry.manifest.worktree, "retained-ignored.txt")), true);
+  });
+
+  it("preserves a lane captured as empty whose worktree holds only ignored files", () => {
+    const allocation = allocateWorktree({ cwd: repo, label: "worker", laneId: id });
+    writeFileSync(join(repo, ".git", "info", "exclude"), `${id}-ignored.txt\n`);
+    writeFileSync(join(allocation.path, `${id}-ignored.txt`), "ignored build output\n");
+    const entry = captureHandoff({
+      allocation,
+      laneId: id,
+      artifactDir,
+      name: "worker",
+      terminalState: { status: "completed", exitCode: 0 },
+    });
+    assert.deepEqual(entry.manifest.changedPaths, []);
+    assert.equal(entry.manifest.childCommits, 0);
+
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /ignored files/);
+
+    const removed = removeLane(laneEntry(id));
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(existsSync(join(entry.manifest.worktree, `${id}-ignored.txt`)), true);
+    assert.equal(
+      git(["show-ref", "--verify", `refs/heads/${entry.manifest.branch}`], repo).includes(
+        entry.manifest.branch,
+      ),
+      true,
+    );
+  });
+
+  it("blocks an altered empty manifest while fresh lineage shows lane commits", () => {
+    const entry = changedLane(id);
+    const persisted = JSON.parse(readFileSync(entry.manifestFile, "utf8"));
+    persisted.childCommits = 0;
+    persisted.changedPaths = [];
+    writeFileSync(entry.manifestFile, `${JSON.stringify(persisted, null, 2)}\n`);
+
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /child commit count does not match its lineage/);
+
+    const removed = removeLane(laneEntry(id));
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(
+      git(["show-ref", "--verify", `refs/heads/${entry.manifest.branch}`], repo).includes(
+        entry.manifest.branch,
+      ),
+      true,
+    );
+  });
+
+  it("preserves a changed lane whose persisted review verdict is BLOCK", () => {
+    const entry = changedLane(id);
+    const persisted = JSON.parse(readFileSync(entry.manifestFile, "utf8"));
+    persisted.review = {
+      verdict: "BLOCK",
+      reviewer: "reviewer",
+      headCommit: entry.manifest.headCommit,
+      at: new Date().toISOString(),
+    };
+    writeFileSync(entry.manifestFile, `${JSON.stringify(persisted, null, 2)}\n`);
+
+    const inspection = inspectLane(laneEntry(id));
+    assert.equal(inspection.removable, false);
+    assert.match(inspection.blockers.join(" "), /review verdict BLOCK does not authorize cleanup/);
+
+    const removed = removeLane(laneEntry(id));
+    assert.equal(removed.removed, false);
+    assert.equal(existsSync(entry.manifest.worktree), true);
+    assert.equal(
+      git(["show-ref", "--verify", `refs/heads/${entry.manifest.branch}`], repo).includes(
+        entry.manifest.branch,
+      ),
+      true,
+    );
+  });
+
+  it("removes a reviewed lane only after its child commits are integrated", () => {
+    const entry = changedLane(id);
+    const review = recordLaneEvidence(entry, {
+      review: { verdict: "OK with notes", reviewer: "reviewer" },
+    });
+    assert.equal(review.ok, true);
+
+    git(["merge", "--no-ff", "-q", entry.manifest.branch, "-m", "integrate lane"], repo);
     const mergeCommit = git(["rev-parse", "HEAD"], repo).trim();
     const merged = recordLaneEvidence(entry, {
       merge: { commit: mergeCommit, attestor: "parent", postMergeChecks: "npm test" },
     });
     assert.equal(merged.ok, true);
+    assert.equal(merged.manifest?.merge?.commit, mergeCommit);
+    assert.equal(merged.manifest?.merge?.reviewedHead, entry.manifest.headCommit);
+    assert.equal(inspectLane(laneEntry(id)).removable, true);
 
-    const final = laneEntry(id).manifest;
-    assert.equal(final.merge?.commit, mergeCommit);
-    assert.equal(final.merge?.reviewedHead, final.review?.headCommit);
-    assert.equal(final.merge?.reviewedHead, final.headCommit);
+    const removed = removeLane(laneEntry(id), { by: "test" });
+    assert.equal(removed.removed, true, removed.reason);
+    assert.equal(existsSync(entry.manifest.worktree), false);
+    assert.equal(git(["branch", "--list", entry.manifest.branch], repo).trim(), "");
   });
 
   it("refuses evidence for a lane whose capture failed", () => {
