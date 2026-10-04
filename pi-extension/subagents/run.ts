@@ -1,4 +1,4 @@
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync } from "node:fs";
 import { terminalSetupHint, createSubagentPane, runScriptInPane, closePane, interruptPane, shellQuote, readPane, readPaneAsync, inspectPane, setPaneTask } from "./herdr.ts";
@@ -639,6 +639,64 @@ function deliverRunFailure(pi: ExtensionAPI, run: RunningSubagent, error: any): 
   );
 }
 
+/** Is `subdir`, relative to the repository root, inside the repository itself? */
+function isRepoRelativePath(subdir: string): boolean {
+  return !isAbsolute(subdir) && subdir !== ".." && !subdir.startsWith(`..${sep}`);
+}
+
+/**
+ * Turn a launch failure that happened after allocation into one error that a
+ * parent can act on: record the lane so `subagent_worktrees` can see it,
+ * close a pane this call created, and keep every worktree — a lane may hold
+ * work, and only an explicit cleanup may remove one.
+ */
+function recordedLaunchFailure(params: {
+  error: unknown;
+  name: string;
+  agent?: string;
+  id: string;
+  artifactDir: string;
+  allocation?: WorktreeAllocation;
+  surface: string | null;
+  ownsSurface: boolean;
+}): Error {
+  const message = params.error instanceof Error ? params.error.message : String(params.error);
+  let receipt = "";
+
+  if (params.allocation) {
+    let detail: string;
+    try {
+      const entry = captureHandoff({
+        allocation: params.allocation,
+        laneId: params.id,
+        artifactDir: params.artifactDir,
+        name: params.name,
+        agent: params.agent,
+        // The child never started; -1 marks "no child exit code" in the receipt.
+        terminalState: { status: "failed", exitCode: -1 },
+      });
+      detail = entry.manifest.capture.ok
+        ? `manifest: ${entry.manifestFile}`
+        : `handoff capture failed: ${entry.manifest.capture.error ?? "unknown error"}`;
+    } catch (captureError) {
+      detail = `handoff capture failed: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+    }
+    receipt = ` The lane is preserved for recovery: ${params.allocation.branch} at ${params.allocation.path} (${detail})`;
+  }
+
+  if (params.surface && params.ownsSurface) {
+    try {
+      closePane(params.surface);
+    } catch {
+      // Best-effort cleanup: the launch error is the one worth reporting.
+    }
+  }
+
+  return new Error(`Subagent "${params.name}" failed to launch: ${message}.${receipt}`, {
+    cause: params.error,
+  });
+}
+
 /**
  * Launch a subagent: creates the herdr pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -687,9 +745,46 @@ export async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+
+  const cliId = agentDefs?.cli ?? "pi";
+  const driver = getHarnessDriver(cliId);
+  driver.validateRuntimePlan?.(runtimePlan, parentThinking);
+
+  // Preflight and allocate the isolated lane before anything is launched: a
+  // dirty or non-Git source checkout rejects the spawn without side effects.
+  let worktreeAllocation: WorktreeAllocation | undefined;
+  if (params.worktree) {
+    worktreeAllocation = allocateWorktree({
+      cwd: targetCwdForSession,
+      label: params.name,
+      laneId: id,
+      baseRef: params.baseRef,
+    });
+  }
+
+  // A lane is a copy of the whole checkout, so a requested repository
+  // subdirectory keeps its repo-relative position inside it.
+  const laneSubdir = worktreeAllocation
+    ? relative(worktreeAllocation.repoRoot, targetCwdForSession)
+    : "";
+  let childCwd = effectiveCwd;
+  if (worktreeAllocation) {
+    const laneSubdirPath = join(worktreeAllocation.path, laneSubdir);
+    // A cwd outside the repository, or one the lane does not have (ignored
+    // files and directories are not copied), cannot be the child's cwd. The
+    // lane root can, and it is where such a child started before lanes existed.
+    childCwd =
+      isRepoRelativePath(laneSubdir) && existsSync(laneSubdirPath)
+        ? laneSubdirPath
+        : worktreeAllocation.path;
+  }
+  // Every directory the launch names — shell cwd, launch profile, seeded
+  // session header, session base, local agent config — follows the cwd the
+  // child really starts in, never the source checkout.
+  const localAgentDir = childCwd ? join(childCwd, ".pi", "agent") : null;
+  const sessionDir = getDefaultSessionDirFor(childCwd ?? ctx.cwd, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -703,133 +798,131 @@ export async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
-  driver.validateRuntimePlan?.(runtimePlan, parentThinking);
-
-  // Preflight and allocate the isolated lane before anything is launched: a
-  // dirty or non-Git source checkout rejects the spawn without side effects.
-  let worktreeAllocation: WorktreeAllocation | undefined;
-  if (params.worktree) {
-    worktreeAllocation = allocateWorktree({
-      cwd: effectiveCwd ?? ctx.cwd,
-      label: params.name,
-      laneId: id,
-      baseRef: params.baseRef,
-    });
-  }
-  const childCwd = worktreeAllocation?.path ?? effectiveCwd;
-
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
-  if (params.task) {
-    setPaneTask(surface, params.task);
-  }
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  let surface: string | null = null;
+  try {
+    const pane = options?.surface ?? createSubagentPane(params.name);
+    surface = pane;
+    if (params.task) {
+      setPaneTask(pane, params.task);
+    }
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-      ponytail: params.ponytail ?? agentDefs?.ponytail,
+    if (launchBehavior.seededSessionMode) {
+      seedSubagentSessionFile({
+        mode: launchBehavior.seededSessionMode,
+        parentSessionFile: sessionFile,
+        childSessionFile: subagentSessionFile,
+        childCwd: childCwd ?? ctx.cwd,
+        ponytail: params.ponytail ?? agentDefs?.ponytail,
+      });
+    }
+
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    if (driver.hasActivitySnapshots) {
+      mkdirSync(dirname(activityFile), { recursive: true });
+    }
+    const { inheritsConversationContext } = launchBehavior;
+
+    // Build the task message
+    // Only full-context fork mode inherits prior conversation state.
+    // Blank-session modes need the wrapper instructions and artifact-backed handoff.
+    const modeHint = effectiveAutoExit
+      ? "Complete your task autonomously."
+      : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+    const summaryInstruction = effectiveAutoExit
+      ? "Your FINAL assistant message should summarize what you accomplished."
+      : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+    const denySet = resolveDenyTools(agentDefs);
+    const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+    const systemPromptMode = agentDefs?.systemPromptMode;
+    const identityInSystemPrompt = systemPromptMode && identity;
+    const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+    const effectiveModel = driver.formatModel(runtimePlan);
+
+    const built = driver.buildCommand({
+      params: { ...params, id },
+      agentDefs,
+      runtimePlan,
+      effectiveModel,
+      effectiveThinking,
+      parentThinking,
+      surface: pane,
+      artifactDir,
+      sessionDir,
+      subagentSessionFile,
+      effectiveCwd: childCwd,
+      localAgentDir,
+      effectiveAutoExit,
+      effectiveInteractive,
+      inheritsConversationContext,
+      taskDelivery: launchBehavior.taskDelivery,
+      denySet,
+      identity,
+      identityInSystemPrompt: Boolean(identityInSystemPrompt),
+      systemPromptMode,
+      roleBlock,
+      modeHint,
+      summaryInstruction,
+      subagentsDir: SUBAGENTS_DIR,
+      shellQuote,
+    });
+
+    const launchScriptName = `${(params.name || "subagent")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+    runScriptInPane(pane, built.command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: (built.launchScriptPreamble ?? [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Surface: ${pane}`,
+      ]).join("\n"),
+    });
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface: pane,
+      startTime,
+      sessionFile: built.sessionFile ?? subagentSessionFile,
+      launchScriptFile,
+      cli: built.cli,
+      sentinelFile: built.sentinelFile,
+      interactive: effectiveInteractive,
+      runtimePlan,
+      ...(worktreeAllocation ? { worktree: { allocation: worktreeAllocation, artifactDir } } : {}),
+      activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
+      lifecycle: !driver.hasActivitySnapshots
+        ? markProcessRunning(createLifecycle(startTime), Date.now())
+        : createLifecycle(startTime),
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  } catch (error) {
+    throw recordedLaunchFailure({
+      error,
+      name: params.name,
+      agent: params.agent,
+      id,
+      artifactDir,
+      allocation: worktreeAllocation,
+      surface,
+      ownsSurface: !surfacePreCreated,
     });
   }
-
-  const activityFile = getSubagentActivityFile(artifactDir, id);
-  if (driver.hasActivitySnapshots) {
-    mkdirSync(dirname(activityFile), { recursive: true });
-  }
-  const { inheritsConversationContext } = launchBehavior;
-
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = effectiveAutoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = effectiveAutoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const effectiveModel = driver.formatModel(runtimePlan);
-
-  const built = driver.buildCommand({
-    params: { ...params, id },
-    agentDefs,
-    runtimePlan,
-    effectiveModel,
-    effectiveThinking,
-    parentThinking,
-    surface,
-    artifactDir,
-    sessionDir,
-    subagentSessionFile,
-    effectiveCwd: childCwd,
-    localAgentDir,
-    effectiveAutoExit,
-    effectiveInteractive,
-    inheritsConversationContext,
-    taskDelivery: launchBehavior.taskDelivery,
-    denySet,
-    identity,
-    identityInSystemPrompt: Boolean(identityInSystemPrompt),
-    systemPromptMode,
-    roleBlock,
-    modeHint,
-    summaryInstruction,
-    subagentsDir: SUBAGENTS_DIR,
-    shellQuote,
-  });
-
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
-  });
-
-  const running: RunningSubagent = {
-    id,
-    name: params.name,
-    task: params.task,
-    agent: params.agent,
-    surface,
-    startTime,
-    sessionFile: built.sessionFile ?? subagentSessionFile,
-    launchScriptFile,
-    cli: built.cli,
-    sentinelFile: built.sentinelFile,
-    interactive: effectiveInteractive,
-    runtimePlan,
-    ...(worktreeAllocation ? { worktree: { allocation: worktreeAllocation, artifactDir } } : {}),
-    activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
-    lifecycle: !driver.hasActivitySnapshots
-      ? markProcessRunning(createLifecycle(startTime), Date.now())
-      : createLifecycle(startTime),
-  };
-
-  runningSubagents.set(id, running);
-  return running;
 }
 
 /**

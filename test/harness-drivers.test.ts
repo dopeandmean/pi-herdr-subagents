@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -14,6 +14,11 @@ import {
   GenericHarnessDriver,
   type SubagentLaunchContext,
 } from "../pi-extension/subagents/harness/index.ts";
+import {
+  createSubagentActivityRecorder,
+  getSubagentActivityFile,
+  readSubagentActivityFile,
+} from "../pi-extension/subagents/activity.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
 
@@ -135,6 +140,67 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("publishes activity snapshots on the path the parent reads", () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), "pi-activity-test-"));
+    const id = "abc12345";
+    try {
+      const built = driver.buildCommand(createMockLaunchContext({
+        artifactDir,
+        params: { id, name: "worker", task: "Analyze the repository structure" },
+      }));
+
+      // The child writes wherever the driver points it; the parent reads
+      // getSubagentActivityFile(). Both must be the same file.
+      const activityFile = getSubagentActivityFile(artifactDir, id);
+      assert.ok(
+        built.command.includes(`PI_SUBAGENT_ACTIVITY_FILE='${activityFile}'`),
+        `expected the shared activity path in: ${built.command}`,
+      );
+
+      createSubagentActivityRecorder({ runningChildId: id, activityFile, now: () => 1_000 }).sessionStart();
+      const read = readSubagentActivityFile(activityFile, id);
+      assert.equal(read.ok, true, "the parent must read the snapshot the child wrote");
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps same-label launches in one second in distinct context artifacts", () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), "pi-context-test-"));
+    try {
+      const launch = (id: string, task: string) =>
+        driver.buildCommand(createMockLaunchContext({
+          artifactDir,
+          taskDelivery: "artifact",
+          identity: `Role instructions for ${id}`,
+          identityInSystemPrompt: true,
+          systemPromptMode: "replace",
+          params: { id, name: "Same Label", task },
+        }));
+
+      const syspromptPath = (command: string) => command.match(/--system-prompt '([^']+)'/)?.[1] ?? "";
+      const taskPath = (command: string) => command.match(/'@([^']+\.md)'/)?.[1] ?? "";
+
+      const first = launch("aaaaaaaa", "Task A");
+      const second = launch("bbbbbbbb", "Task B");
+
+      // The run id — not the second-resolution timestamp — is what keeps two
+      // same-label spawns from overwriting each other's prompt files.
+      assert.match(syspromptPath(first.command), /-aaaaaaaa\.md$/);
+      assert.match(taskPath(first.command), /-aaaaaaaa\.md$/);
+      assert.match(syspromptPath(second.command), /-bbbbbbbb\.md$/);
+      assert.match(taskPath(second.command), /-bbbbbbbb\.md$/);
+      assert.notEqual(taskPath(first.command), taskPath(second.command));
+
+      assert.match(readFileSync(syspromptPath(first.command), "utf8"), /Role instructions for aaaaaaaa/);
+      assert.match(readFileSync(taskPath(first.command), "utf8"), /Task A/);
+      assert.doesNotMatch(readFileSync(taskPath(first.command), "utf8"), /Task B/);
+      assert.match(readFileSync(taskPath(second.command), "utf8"), /Task B/);
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true });
+    }
   });
 });
 

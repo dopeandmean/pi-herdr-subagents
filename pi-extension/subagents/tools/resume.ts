@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
-import { formatPiLaunch, readPiLaunchProfile } from "../harness/drivers/pi.ts";
+import { contextArtifactName, formatPiLaunch, readPiLaunchProfile } from "../harness/drivers/pi.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
 import { createSubagentPane, isTerminalAvailable, runScriptInPane, setPaneTask, shellQuote } from "../herdr.ts";
 import { createLifecycle } from "../lifecycle.ts";
@@ -120,17 +120,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
 
     let resumeMsgFile: string | undefined;
     if (params.message) {
-      const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      resumeMsgFile = join(
-        artifactDir,
-        "subagent-resume",
-        `${name
-          .toLowerCase()
-          .replace(/[^a-z0-9\s-]/g, "")
-          .replace(/\s+/g, "-")
-          .replace(/-+/g, "-")
-          .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-      );
+      resumeMsgFile = join(artifactDir, "subagent-resume", contextArtifactName(name, id));
       mkdirSync(dirname(resumeMsgFile), { recursive: true });
       writeFileSync(resumeMsgFile, params.message, "utf8");
       parts.push(`@${resumeMsgFile}`);

@@ -7,6 +7,7 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { SENTINEL_TRAILER } from "../../handoff.ts";
+import { getSubagentActivityFile } from "../../activity.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -36,7 +37,12 @@ export interface PiLaunchProfile {
 export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null {
   const path = `${sessionFile}.launch.json`;
   if (!existsSync(path)) return null; // Sessions created before launch profiles still resume.
-  const profile = JSON.parse(readFileSync(path, "utf8"));
+  let profile: any;
+  try {
+    profile = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error(`Invalid Pi launch profile: ${path} (unreadable JSON)`);
+  }
   if (!Array.isArray(profile?.args) || profile.args[0] !== "pi" ||
       !profile.args.every((v: unknown) => typeof v === "string") ||
       !profile.env || typeof profile.env !== "object" || Array.isArray(profile.env) ||
@@ -45,6 +51,22 @@ export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null
     throw new Error(`Invalid Pi launch profile: ${path}`);
   }
   return profile;
+}
+
+/**
+ * Context artifact filename for one run — the task, role prompt or resume
+ * message the child reads. The run id keeps two same-label launches in the
+ * same second from overwriting each other's file.
+ */
+export function contextArtifactName(label: string, runId: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const safeName = label
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return `${safeName || "subagent"}-${timestamp}-${runId}.md`;
 }
 
 export function formatPiLaunch(profile: PiLaunchProfile, shellQuote: (value: string) => string): string {
@@ -103,14 +125,11 @@ export class PiHarnessDriver implements HarnessDriver {
 
     if (identityInSystemPrompt && identity) {
       const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-      const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const spSafeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
-      const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+      const syspromptPath = join(
+        artifactDir,
+        "context",
+        contextArtifactName(`${params.name}-sysprompt`, params.id),
+      );
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
       parts.push(flag, syspromptPath);
@@ -145,7 +164,7 @@ export class PiHarnessDriver implements HarnessDriver {
     env.PI_SUBAGENT_AUTO_EXIT = effectiveAutoExit ? "1" : "0";
     env.PI_SUBAGENT_SESSION = subagentSessionFile;
     env.PI_SUBAGENT_ID = params.id;
-    env.PI_SUBAGENT_ACTIVITY_FILE = join(artifactDir, `subagent-activity-${params.id}.json`);
+    env.PI_SUBAGENT_ACTIVITY_FILE = getSubagentActivityFile(artifactDir, params.id);
     env.PI_SUBAGENT_SURFACE = surface;
 
     const fullTask = taskDelivery === "direct"
@@ -156,15 +175,7 @@ export class PiHarnessDriver implements HarnessDriver {
     if (taskDelivery === "direct") {
       taskArg = fullTask;
     } else {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const safeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
-      const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-      const artifactPath = join(artifactDir, artifactName);
+      const artifactPath = join(artifactDir, "context", contextArtifactName(params.name, params.id));
       mkdirSync(dirname(artifactPath), { recursive: true });
       writeFileSync(artifactPath, fullTask, "utf8");
       taskArg = `@${artifactPath}`;
