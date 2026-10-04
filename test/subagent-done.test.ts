@@ -1,6 +1,6 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import subagentDoneExtension, { shouldMarkUserTookOver, shouldAutoExitOnAgentEnd, findLatestAssistantError, buildCompletionSidecar } from "../pi-extension/subagents/subagent-done.ts";
 import { createMockExtensionApi, restoreEnvVar, withTempDir } from "./helpers.ts";
@@ -94,6 +94,48 @@ describe("subagent-done.ts", () => {
       } finally {
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
       }
+    });
+  });
+
+  describe("activity write failures", () => {
+    it("notifies once through the child UI when the recorder gives up", () => {
+      withTempDir((dir) => {
+        const blocker = join(dir, "not-a-directory");
+        writeFileSync(blocker, "blocker\n");
+        const previousId = process.env.PI_SUBAGENT_ID;
+        const previousFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+        const previousSkills = process.env.PI_SUBAGENT_SKILLS;
+        process.env.PI_SUBAGENT_ID = "child-warn";
+        process.env.PI_SUBAGENT_ACTIVITY_FILE = join(blocker, "subagent-activity", "child-warn.json");
+        process.env.PI_SUBAGENT_SKILLS = "none";
+
+        try {
+          const { api, eventHandlers } = createMockExtensionApi();
+          subagentDoneExtension(api);
+          const notifications: Array<{ message: string; type?: string }> = [];
+          const ctx = {
+            shutdown: () => {},
+            ui: {
+              setWidget: () => {},
+              notify: (message: string, type?: string) => notifications.push({ message, type }),
+            },
+          };
+
+          eventHandlers.get("session_start")![0]({ type: "session_start" }, ctx);
+          const input = eventHandlers.get("input")![0];
+          for (let index = 0; index < 5; index++) {
+            input({ text: "go", images: [] }, ctx);
+          }
+
+          assert.equal(notifications.length, 1, "one bounded warning, never per-failure spam");
+          assert.equal(notifications[0].type, "warning");
+          assert.match(notifications[0].message, /activity reporting disabled/i);
+        } finally {
+          restoreEnvVar("PI_SUBAGENT_ID", previousId);
+          restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previousFile);
+          restoreEnvVar("PI_SUBAGENT_SKILLS", previousSkills);
+        }
+      });
     });
   });
 

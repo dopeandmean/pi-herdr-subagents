@@ -182,6 +182,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
+  // SAFETY: every field of SubagentActivityState was checked above; the cast only
+  // erases the Record<string, unknown> shape the validator walks.
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
 
@@ -295,6 +297,12 @@ export function createSubagentActivityRecorder(params: {
   runningChildId?: string;
   activityFile?: string;
   now?: () => number;
+  /**
+   * Called once, with the last write error, when repeated write failures disable
+   * this recorder for good. Reads of the activity file then go stale or missing,
+   * so the parent needs one bounded diagnostic instead of silent degradation.
+   */
+  onDisabled?: (error: unknown) => void;
 }): SubagentActivityRecorder {
   const runningChildId = params.runningChildId?.trim();
   const activityFile = params.activityFile?.trim();
@@ -338,9 +346,12 @@ export function createSubagentActivityRecorder(params: {
       writeSubagentActivityFile(activityFile, activity);
       lastFlushAt = now();
       failureCount = 0;
-    } catch {
+    } catch (error) {
       failureCount += 1;
-      if (failureCount >= MAX_WRITE_FAILURES) disable();
+      if (failureCount >= MAX_WRITE_FAILURES) {
+        disable();
+        params.onDisabled?.(error);
+      }
     }
   }
 

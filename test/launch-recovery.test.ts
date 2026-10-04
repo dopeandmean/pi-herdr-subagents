@@ -5,7 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getDefaultSessionDirFor } from "../pi-extension/subagents/discovery.ts";
-import { cleanupSubagentsForShutdown, getArtifactDir, launchSubagent, runningSubagents, stopTracking } from "../pi-extension/subagents/run.ts";
+import { cleanupSubagentsForShutdown, getArtifactDir, launchSubagent, runningSubagents, stopTracking, watchSubagentRun } from "../pi-extension/subagents/run.ts";
+import { registerHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
+import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 import { createTool as createResumeTool } from "../pi-extension/subagents/tools/resume.ts";
 import { listLanes } from "../pi-extension/subagents/worktree.ts";
 import { createMockExtensionApi, createSessionFile, SESSION_HEADER, USER_MSG } from "./helpers.ts";
@@ -308,6 +310,67 @@ describe("worktree child cwd", () => {
   });
 });
 
+describe("terminal pane retention", () => {
+  it("leaves a completed pane visible instead of closing it", async () => {
+    const sessionDir = join(sandbox, "retain-sessions");
+    const parentSessionFile = parentSession("retain-parent", [SESSION_HEADER, USER_MSG]);
+    writeFileSync(logFile, "");
+
+    const running = await launchSubagent(
+      { name: "Retained", task: "report back" },
+      launchContext({ sessionDir, parentSessionFile, cwd: sandbox }),
+      "medium",
+    );
+    const result = await watchSubagentRun(running, new AbortController().signal);
+
+    assert.equal(result.exitCode, 0);
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /pane run/, "the run really launched into its own pane");
+    assert.doesNotMatch(log, /pane close/, "a terminal pane stays visible for the parent");
+  });
+
+  it("carries a provider error from the completion sidecar through the external driver branch", async () => {
+    registerHarnessDriver({
+      id: "b15-test-driver",
+      name: "B15 Test Driver",
+      hasActivitySnapshots: false,
+      supportsTurnInterrupt: false,
+      formatModel: (plan: any) => plan.modelId,
+      buildCommand: () => {
+        throw new Error("not used by this test");
+      },
+      extractResult: () => ({ summary: "driver summary" }),
+    } as any);
+
+    const sessionDir = join(sandbox, "sidecar-sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionFile = join(sessionDir, "child.jsonl");
+    writeFileSync(sessionFile, "");
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify({
+      type: "error",
+      errorMessage: "provider exploded",
+      stopReason: "error",
+    }));
+
+    const running = {
+      id: "sidecar-run",
+      name: "Sidecar",
+      task: "do the work",
+      surface: "fx:7",
+      startTime: Date.now(),
+      sessionFile,
+      cli: "b15-test-driver",
+      interactive: false,
+      lifecycle: createLifecycle(Date.now()),
+    };
+    const result = await watchSubagentRun(running as any, new AbortController().signal);
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.errorMessage, "provider exploded");
+    assert.equal(result.summary, "driver summary");
+  });
+});
+
 describe("resume artifacts", () => {
   it("names the resume message after the resume run, so same-second resumes stay distinct", async () => {
     const sessionDir = join(sandbox, "resume-sessions");
@@ -340,7 +403,7 @@ describe("resume artifacts", () => {
       assert.notEqual(first, second);
     } finally {
       // Let the aborted watchers settle while the fake herdr is still on PATH:
-      // their best-effort pane close must never reach the real CLI.
+      // a resumed run must not deliver its result or touch the real CLI after teardown.
       cleanupSubagentsForShutdown("quit", runningSubagents);
       await new Promise((resolve) => setTimeout(resolve, 250));
       stopTracking();

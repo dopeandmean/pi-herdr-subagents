@@ -175,6 +175,42 @@ describe("subagents widget rendering", () => {
     }
   });
 
+  it("marks rows whose activity snapshots cannot be read", () => {
+    const healthy = observeLifecycleActivity(
+      createLifecycle(5_000),
+      {
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 5_000,
+          updatedAt: 29_000,
+          sequence: 1,
+          latestEvent: "agent_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: false,
+        },
+      },
+      29_000,
+    );
+    const broken = observeLifecycleActivity(
+      createLifecycle(5_000),
+      { ok: false, reason: "invalid", error: "not json" },
+      29_000,
+    );
+
+    const lines = renderSubagentWidgetLines([
+      { id: "a1", name: "Readable", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", lifecycle: healthy, interactive: false },
+      { id: "a2", name: "Blind", task: "", surface: "s2", startTime: 5_000, sessionFile: "s2", lifecycle: broken, interactive: false },
+    ], 72);
+
+    assert.doesNotMatch(lines[1], /activity/);
+    assert.match(lines[2], /activity invalid/);
+  });
+
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
     const line = borderLine(" A ", " 999 msgs (999.9KB) ", 16);
     assert.equal(visibleWidth(line), 16);

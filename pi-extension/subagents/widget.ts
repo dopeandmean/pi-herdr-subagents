@@ -144,8 +144,13 @@ export function renderSubagentWidgetLines(
     const runtimeTag = agent.runtimePlan
       ? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
       : "";
+    // A recorder that cannot publish snapshots leaves the parent blind between
+    // Herdr inspections. Say so on the row instead of silently degrading.
+    const activityProblem = agent.lifecycle.activityHealth.kind === "problem"
+      ? ` · activity ${agent.lifecycle.activityHealth.reason}`
+      : "";
     const right = statusEnabled
-      ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
+      ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()}${activityProblem} `
       : agent.cli && agent.cli !== "pi"
         ? ` ${runtimeTag}running… `
         : ` ${runtimeTag}starting… `;

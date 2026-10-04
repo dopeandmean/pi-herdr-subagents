@@ -105,9 +105,20 @@ export default function (pi: ExtensionAPI) {
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const assignedSkills = process.env.PI_SUBAGENT_SKILLS ?? "";
+  // The recorder is created before any UI context exists, so its one bounded
+  // warning waits for session_start. Otherwise a broken activity file would
+  // degrade the parent's status view with nothing said about it.
+  let notify: ((message: string, type?: "info" | "warning" | "error") => void) | undefined;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+    onDisabled: (error) => {
+      notify?.(
+        "Subagent activity reporting disabled after repeated write failures: " +
+          `${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    },
   });
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -168,6 +179,7 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    notify = (message, type) => ctx.ui.notify(message, type);
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);

@@ -625,15 +625,25 @@ function deliverRunResult(
   );
 }
 
-function deliverRunFailure(pi: ExtensionAPI, run: RunningSubagent, error: any): void {
+/** Exported for tests: the failure payload is what the result renderer styles. */
+export function deliverRunFailure(pi: ExtensionAPI, run: RunningSubagent, error: any): void {
   const completionApi = settleRun(pi, run);
   if (!completionApi) return;
+  const errorMessage = error?.message ?? String(error);
   completionApi.sendMessage(
     {
       customType: "subagent_result",
-      content: `Sub-agent "${run.name}" error: ${error?.message ?? String(error)}`,
+      content: `Sub-agent "${run.name}" error: ${errorMessage}`,
       display: true,
-      details: { name: run.name, task: run.task, error: error?.message },
+      details: {
+        name: run.name,
+        task: run.task,
+        error: error?.message,
+        // The watcher rejected instead of finishing, so this run failed. Without
+        // the status fields the renderer would style it as a success.
+        exitCode: 1,
+        errorMessage,
+      },
     },
     { triggerTurn: true, deliverAs: "steer" },
   );
@@ -994,8 +1004,11 @@ export function finalizeWorktreeLane(
 
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface,
- * and removes the entry from runningSubagents.
+ * the summary from the session file, and delivers it.
+ *
+ * Terminal runs keep their pane: orchestrator policy is "leave completed panes
+ * visible", and closing one destroys evidence the parent may still want to read.
+ * Only a pane this process created and then failed to launch is cleaned up.
  */
 export async function watchSubagent(
   running: RunningSubagent,
@@ -1045,7 +1058,6 @@ export async function watchSubagentRun(
       });
 
       if (extracted) {
-        closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1056,6 +1068,7 @@ export async function watchSubagentRun(
           summary: extracted.summary,
           exitCode: result.exitCode,
           elapsed,
+          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
         };
@@ -1107,7 +1120,6 @@ export async function watchSubagentRun(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1123,11 +1135,6 @@ export async function watchSubagentRun(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
-    try {
-      closePane(surface);
-    } catch {
-      // Best effort: the pane may already be gone.
-    }
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),

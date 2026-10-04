@@ -1,9 +1,9 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
-import { cleanupSubagentsForShutdown, selectCompletionApi, shouldDeliverSubagentCompletion, shouldPreserveSubagentsOnShutdown, runningSubagents } from "../pi-extension/subagents/run.ts";
+import { cleanupSubagentsForShutdown, selectCompletionApi, shouldDeliverSubagentCompletion, shouldPreserveSubagentsOnShutdown } from "../pi-extension/subagents/run.ts";
 import { createSubagentActivityRecorder, getSubagentActivityFile, readSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
 import { createLifecycle, projectLifecycle, observeActivity as observeLifecycleActivity } from "../pi-extension/subagents/lifecycle.ts";
 import { createMockExtensionApi, createTestDir, testApi, withMockedNow, withTempDir } from "./helpers.ts";
@@ -238,6 +238,45 @@ describe("subagent activity snapshots", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("warns once when repeated write failures permanently disable the recorder", () => {
+    withTempDir((dir) => {
+      // A regular file where the activity directory should be makes every write fail.
+      const blocker = join(dir, "not-a-directory");
+      writeFileSync(blocker, "blocker\n");
+      const failures: unknown[] = [];
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-6",
+        activityFile: join(blocker, "subagent-activity", "child-6.json"),
+        onDisabled: (error) => failures.push(error),
+      });
+
+      for (let index = 0; index < 6; index++) {
+        recorder.toolExecutionStart(`tool-${index}`, "bash");
+        recorder.toolExecutionEnd(`tool-${index}`, "bash");
+      }
+
+      assert.equal(failures.length, 1, "one bounded diagnostic, never per-failure spam");
+      assert.ok(failures[0] instanceof Error);
+    });
+  });
+
+  it("stays silent when the recorder stops normally", () => {
+    withTempDir((dir) => {
+      const failures: unknown[] = [];
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-7",
+        activityFile: getSubagentActivityFile(dir, "child-7"),
+        onDisabled: (error) => failures.push(error),
+      });
+
+      recorder.sessionStart();
+      recorder.agentStart();
+      recorder.agentEndDone();
+
+      assert.deepEqual(failures, []);
+    });
   });
 });
 

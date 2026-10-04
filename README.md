@@ -67,6 +67,8 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
+Terminal runs keep their pane. A completed, failed or cancelled run leaves its pane open so the result stays inspectable in the shared agents tab; only a pane this process created and then failed to launch is closed, and there is no automatic retention cap yet — close panes manually when the tab gets crowded.
+
 Subagent panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
