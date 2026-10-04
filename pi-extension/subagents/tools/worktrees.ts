@@ -7,7 +7,8 @@ import { Text } from "@earendil-works/pi-tui";
 const DOC =
   "Inspect and maintain the Git worktree lanes created by isolated subagent spawns (worktree: true). " +
   "action=\"status\" (default) is read-only: it lists each lane's branch, worktree, captured patch, review/merge evidence, and whether it can be removed. " +
-  "action=\"cleanup\" removes a lane's worktree and branch, revalidating ownership, checked-out branch, head commit, and a clean tree immediately before removal; lanes that fail any check are preserved. " +
+  "action=\"cleanup\" removes a lane's worktree and branch, revalidating ownership, checked-out branch, head commit, and a clean tree immediately before removal. " +
+  "A lane with work also needs a current-head OK or OK with notes review plus integration proof covering every lane commit; unexempted ignored files, a BLOCK/stale/missing review, unverifiable lineage, or any other failed check preserve the lane. " +
   "action=\"record\" writes a reviewer verdict or merge attestation into a lane's manifest. " +
   "Merging is never automatic: apply the lane branch or patch yourself, then record the merge commit.";
 

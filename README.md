@@ -273,7 +273,7 @@ artifacts/<session-id>/subagent-worktrees/<lane-id>/
   manifest.json   base/head commits, branch, worktree, changed paths, terminal state, review/merge evidence
 ```
 
-The manifest path, branch, and patch summary arrive with the completion message. Lanes that changed nothing are removed automatically; lanes with work are preserved so you can review and merge them:
+The manifest path, branch, and patch summary arrive with the completion message. Lanes that captured no changes are removed automatically after a fresh inspection passes; lanes with work are preserved so you can review and merge them:
 
 ```typescript
 subagent_worktrees({ action: "status" });                                   // read-only plan
@@ -281,7 +281,7 @@ subagent_worktrees({ action: "record", lane: "1a2b3c4d", verdict: "OK", reviewer
 subagent_worktrees({ action: "cleanup", lane: "1a2b3c4d" });                // or lane: "eligible"
 ```
 
-Cleanup revalidates repository ownership, checked-out branch, head commit, and a clean tree immediately before removing anything, and preserves the lane on any mismatch. Merging is never automatic: apply the branch or patch yourself (`git merge pi-subagents/worker-1a2b3c4d`), then record the merge commit with `action: "record"`. Reviewers read the captured patch read-only; the recorded verdict is bound to the lane's exact captured head.
+Cleanup revalidates repository ownership, checked-out branch, head commit, and a clean tree immediately before removing anything: a lane with work is removed only with an `OK`/`OK with notes` review bound to the lane's current head plus integration proof covering every lane commit, and unexempted ignored files, a BLOCK/stale/missing review, or unverifiable lineage preserve the lane. Merging is never automatic: apply the branch or patch yourself (`git merge pi-subagents/worker-1a2b3c4d`), then record the merge commit with `action: "record"`. Reviewers read the captured patch read-only; the recorded verdict is bound to the lane's exact captured head.
 
 ---
 
