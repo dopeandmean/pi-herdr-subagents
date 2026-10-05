@@ -1,7 +1,7 @@
 ---
 name: subagent-reviewer
 description: Independently reviews correctness, requirements and missed blast radius
-model: deepseek/deepseek-v4-pro
+model: openai/gpt-6-sol
 thinking: max
 tools: read, bash, fffind, ffgrep, codemode
 skills: code-review, code-quality-checklist

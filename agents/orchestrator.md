@@ -4,7 +4,7 @@ description: Coordinates scoped implementation, independent review and proportio
 model: deepseek/deepseek-flash
 thinking: max
 tools: read, bash, write, fffind, ffgrep, codemode, subagent, subagent_resume, subagents_list, subagent_worktrees
-skills: none
+skills:
 ponytail: full
 spawning: true
 auto-exit: false

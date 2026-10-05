@@ -2,7 +2,7 @@
 name: subagent-tester
 description: Runs scoped verification and classifies failures
 model: deepseek/deepseek-flash
-thinking: medium
+thinking: high
 tools: read, bash, fffind, ffgrep, codemode
 skills: none
 ponytail: off

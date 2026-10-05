@@ -2,7 +2,7 @@
 name: subagent-explorer
 description: Performs focused repository discovery for delegation packets
 model: deepseek/deepseek-flash
-thinking: low
+thinking: high
 tools: read, fffind, ffgrep, codemode
 skills: none
 ponytail: off
