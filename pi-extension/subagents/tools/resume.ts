@@ -1,11 +1,11 @@
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getSubagentActivityFile } from "../activity.ts";
-import { contextArtifactName, formatPiLaunch, readPiLaunchProfile, type PiLaunchProfile } from "../harness/drivers/pi.ts";
+import { contextArtifactName, formatPiLaunch, readPiLaunchProfile, resumeActivityLaunch, type PiLaunchProfile } from "../harness/drivers/pi.ts";
 import { SENTINEL_TRAILER } from "../handoff.ts";
 import { createSubagentPane, isTerminalAvailable, paneRunLabel, runScriptInPane, setPaneTaskLabel, shellQuote } from "../herdr.ts";
 import { createLifecycle } from "../lifecycle.ts";
-import { type RunningSubagent, getArtifactDir, getShellReadyDelayMs, muxUnavailableResult, resolveResumeLaunchBehavior, runningSubagents, startStatusRefresh, startWidgetRefresh, superviseRun } from "../run.ts";
+import { type RunningSubagent, getArtifactDir, getShellReadyDelayMs, muxUnavailableResult, resolveResumeLaunchBehavior, startStatusRefresh, startWidgetRefresh, superviseRun, trackRunningSubagent } from "../run.ts";
 import { findLastAssistantMessage, getNewEntries } from "../session.ts";
 import { lanesContaining, lanesForSession, validateLaneResume } from "../worktree.ts";
 import { Text } from "@earendil-works/pi-tui";
@@ -211,6 +211,11 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
     if (!profile) parts.push("-e", subagentDonePath);
 
+    // Refresh the Activity transport from this process: the profile's copy, if
+    // any, named a collector that may already be gone.
+    const activity = resumeActivityLaunch(parts);
+    parts.push(...activity.args);
+
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
 
@@ -223,7 +228,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
     }
 
     // Preserve role settings while assigning this resumed run a fresh identity.
-    const env = profile ? { ...profile.env } : {};
+    const env = { ...profile?.env, ...activity.env };
     if (!profile && process.env.PI_CODING_AGENT_DIR) env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
     env.PI_SUBAGENT_NAME = name;
     env.PI_SUBAGENT_SESSION = params.sessionPath;
@@ -271,7 +276,7 @@ export function createTool(pi: ExtensionAPI): ToolDefinition<typeof ResumeParams
       ...(lane ? { worktree: lane } : {}),
       lifecycle: createLifecycle(startTime),
     };
-    runningSubagents.set(id, running);
+    trackRunningSubagent(running);
     startWidgetRefresh();
     startStatusRefresh(pi);
 

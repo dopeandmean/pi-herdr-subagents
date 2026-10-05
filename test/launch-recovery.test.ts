@@ -11,6 +11,7 @@ import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 import { createTool as createResumeTool } from "../pi-extension/subagents/tools/resume.ts";
 import { listLanes } from "../pi-extension/subagents/worktree.ts";
 import { writeCompletionSidecar } from "../pi-extension/subagents/handoff.ts";
+import { shellQuote } from "../pi-extension/subagents/herdr.ts";
 import { createMockExtensionApi, createSessionFile, SESSION_HEADER, USER_MSG, writeAgentFile } from "./helpers.ts";
 
 /**
@@ -799,6 +800,117 @@ describe("pane metadata", () => {
       cleanupSubagentsForShutdown("quit", runningSubagents);
       await new Promise((resolve) => setTimeout(resolve, 250));
       stopTracking();
+    }
+  });
+});
+
+describe("Activity transport forwarding", () => {
+  const ACTIVITY_NAMES = [
+    "PI_ACTIVITY_ENDPOINT",
+    "PI_ACTIVITY_ROOT",
+    "PI_ACTIVITY_GENERATION",
+    "PI_ACTIVITY_REPORTER",
+  ] as const;
+
+  /** Restores the four transient names this suite writes into the parent env. */
+  function saveActivityEnv(): () => void {
+    const saved = ACTIVITY_NAMES.map((name) => [name, process.env[name]] as const);
+    return () => {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    };
+  }
+
+  function countOccurrences(haystack: string, needle: string): number {
+    return haystack.split(needle).length - 1;
+  }
+
+  it("forwards the collector to a spawned child without writing it into the launch profile", async () => {
+    const restore = saveActivityEnv();
+    const sessionDir = join(sandbox, "activity-launch-sessions");
+    const parentSessionFile = parentSession("activity-launch-parent", [SESSION_HEADER, USER_MSG]);
+    const reporter = join(sandbox, "activity-reporter.ts");
+    process.env.PI_ACTIVITY_ENDPOINT = "/tmp/pi-activity-e2e.sock";
+    process.env.PI_ACTIVITY_ROOT = "sess-launch";
+    process.env.PI_ACTIVITY_GENERATION = "12";
+    process.env.PI_ACTIVITY_REPORTER = reporter;
+
+    try {
+      const launched = await launchSubagent(
+        { name: "Activity Worker", task: "report back" },
+        launchContext({ sessionDir, parentSessionFile, cwd: sandbox }),
+        "medium",
+      );
+
+      const script = readFileSync(launched.launchScriptFile!, "utf8");
+      assert.ok(script.includes(`PI_ACTIVITY_ENDPOINT=${shellQuote("/tmp/pi-activity-e2e.sock")}`));
+      assert.ok(script.includes(`PI_ACTIVITY_ROOT=${shellQuote("sess-launch")}`));
+      assert.ok(script.includes(`PI_ACTIVITY_GENERATION=${shellQuote("12")}`));
+      assert.equal(countOccurrences(script, `-e ${shellQuote(reporter)}`), 1);
+      assert.doesNotMatch(
+        readFileSync(`${launched.sessionFile}.launch.json`, "utf8"),
+        /PI_ACTIVITY_/,
+        "the durable profile never carries a collector endpoint",
+      );
+    } finally {
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      stopTracking();
+      restore();
+    }
+  });
+
+  it("refreshes the collector from the current parent on resume, never from the profile", async () => {
+    const restore = saveActivityEnv();
+    const sessionDir = join(sandbox, "activity-resume-sessions");
+    const sessionPath = parentSession("activity-resume-parent", [SESSION_HEADER, USER_MSG]);
+    const staleReporter = join(sandbox, "stale-reporter.ts");
+    const reporter = join(sandbox, "activity-reporter.ts");
+    writeFileSync(
+      `${sessionPath}.launch.json`,
+      JSON.stringify({
+        args: ["pi", "--session", sessionPath, "-e", join(agentDir, "subagent-done.ts")],
+        env: {
+          PI_SUBAGENT_AGENT: "activity-role",
+          PI_ACTIVITY_ENDPOINT: "/tmp/stale-activity.sock",
+          PI_ACTIVITY_ROOT: "root-stale",
+          PI_ACTIVITY_REPORTER: staleReporter,
+        },
+        cwd: sandbox,
+      }),
+    );
+    process.env.PI_ACTIVITY_ENDPOINT = "/tmp/fresh-activity.sock";
+    process.env.PI_ACTIVITY_ROOT = "root-fresh";
+    process.env.PI_ACTIVITY_REPORTER = reporter;
+
+    try {
+      const { api } = createMockExtensionApi();
+      const resume = createResumeTool(api);
+      const ctx = {
+        sessionManager: { getSessionId: () => "sess-launch", getSessionDir: () => sessionDir },
+      } as any;
+      const resumed: any = await resume.execute(
+        "call-1",
+        { sessionPath, name: "Activity Resume", message: "keep going" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(resumed.details.status, "started");
+
+      const script = readFileSync(resumed.details.launchScriptFile, "utf8");
+      assert.ok(script.includes(`PI_ACTIVITY_ENDPOINT=${shellQuote("/tmp/fresh-activity.sock")}`));
+      assert.ok(script.includes(`PI_ACTIVITY_ROOT=${shellQuote("root-fresh")}`));
+      assert.equal(countOccurrences(script, `-e ${shellQuote(reporter)}`), 1);
+      assert.doesNotMatch(script, /stale-activity|stale-reporter/);
+      assert.ok(script.includes(`PI_SUBAGENT_AGENT=${shellQuote("activity-role")}`), "durable role settings still resume");
+    } finally {
+      cleanupSubagentsForShutdown("quit", runningSubagents);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      stopTracking();
+      restore();
     }
   });
 });

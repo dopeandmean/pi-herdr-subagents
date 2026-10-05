@@ -16,7 +16,7 @@ import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 import { findLastAssistantMessage, findObservedSessionRuntime, getNewEntries, seedSubagentSessionFile } from "./session.ts";
 import { capStatusLines, formatElapsedDuration, formatStatusAggregate, normalizeStatusName, loadStatusConfig } from "./status.ts";
 import { allocateWorktree, captureHandoff, removeLane, type LaneEntry, type WorktreeAllocation } from "./worktree.ts";
-import { getSubagentActivityFile, readSubagentActivityFile, type ActivityReadResult, type SubagentActivityState } from "./activity.ts";
+import { getSubagentActivityFile, publishActivityEvent, readSubagentActivityFile, type ActivityReadResult, type SubagentActivityState } from "./activity.ts";
 import { createLifecycle, formatLifecycleTransitionLine, lifecycleTransition, markCompleted, markCompletionDetected, markDelivery, markFailed, markInterruptRequested, markProcessRunning, observeActivity, observePaneInspection, projectLifecycle, type LifecycleProjection, type SubagentLifecycle, type PaneInspection } from "./lifecycle.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 /**
@@ -325,6 +325,65 @@ export function updateWidget() {
  * as standalone prompts in the child session.
  */
 
+
+/** Emitting session id for Activity events, '' before the first session_start. */
+function publishingSessionId(): string {
+  try {
+    return runtime.latestCtx?.sessionManager?.getSessionId?.() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+type ChildLifecycleKind =
+  | "child_started"
+  | "child_completion_detected"
+  | "child_completed"
+  | "child_failed"
+  | "child_cancelled";
+
+/**
+ * Report one authoritative child lifecycle transition to the Activity consumer.
+ * herdr offers no fallback and suppresses nothing: the widget, wake/steer policy
+ * and completion delivery are unchanged whether or not anyone is listening.
+ */
+function publishChildLifecycle(
+  running: Pick<RunningSubagent, "id" | "name" | "sessionFile">,
+  event: {
+    kind: ChildLifecycleKind;
+    summary: string;
+    severity?: "info" | "warning";
+    details?: string;
+  },
+): void {
+  const parent = publishingSessionId();
+  publishActivityEvent(runtime.pi, {
+    session: parent,
+    actor: { kind: "child", name: running.name, id: running.id, ...(parent ? { parent } : {}) },
+    source: "subagents",
+    kind: event.kind,
+    severity: event.severity ?? "info",
+    summary: event.summary,
+    ...(event.details ? { details: event.details } : {}),
+  });
+}
+
+/**
+ * Register a new run in the manager and report it as started. Every way a child
+ * enters tracking goes through here, so a start is published exactly once.
+ */
+export function trackRunningSubagent(running: RunningSubagent): void {
+  runningSubagents.set(running.id, running);
+  publishChildLifecycle(running, {
+    kind: "child_started",
+    summary: `Sub-agent "${running.name}" started`,
+    details: [
+      `id: ${running.id}`,
+      `session: ${running.sessionFile}`,
+      ...(running.agent ? [`agent: ${running.agent}`] : []),
+    ].join("\n"),
+  });
+}
 
 export function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
   if (running.lifecycle) return running.lifecycle;
@@ -936,7 +995,7 @@ export async function launchSubagent(
         : createLifecycle(startTime),
     };
 
-    runningSubagents.set(id, running);
+    trackRunningSubagent(running);
     return running;
   } catch (error) {
     throw recordedLaunchFailure({
@@ -1062,6 +1121,10 @@ export async function watchSubagentRun(
 
     const detectedAt = Date.now();
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
+    publishChildLifecycle(running, {
+      kind: "child_completion_detected",
+      summary: `Sub-agent "${name}" exited (code ${result.exitCode})`,
+    });
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
@@ -1077,9 +1140,22 @@ export async function watchSubagentRun(
       });
 
       if (extracted) {
+        const failure = result.errorMessage ?? extracted.summary;
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
-          : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
+          : markFailed(running.lifecycle, failure, Date.now(), result.exitCode);
+        if (result.exitCode === 0) {
+          publishChildLifecycle(running, {
+            kind: "child_completed",
+            summary: `Sub-agent "${name}" completed (${formatElapsed(elapsed)})`,
+          });
+        } else {
+          publishChildLifecycle(running, {
+            kind: "child_failed",
+            severity: "warning",
+            summary: `Sub-agent "${name}" failed: ${failure}`,
+          });
+        }
 
         return {
           name,
@@ -1139,9 +1215,22 @@ export async function watchSubagentRun(
           : "Sub-agent exited without output";
     }
 
+    const failure = result.errorMessage ?? summary;
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+      : markFailed(running.lifecycle, failure, Date.now(), result.exitCode);
+    if (result.exitCode === 0) {
+      publishChildLifecycle(running, {
+        kind: "child_completed",
+        summary: `Sub-agent "${name}" completed (${formatElapsed(elapsed)})`,
+      });
+    } else {
+      publishChildLifecycle(running, {
+        kind: "child_failed",
+        severity: "warning",
+        summary: `Sub-agent "${name}" failed: ${failure}`,
+      });
+    }
 
     return {
       name,
@@ -1154,12 +1243,21 @@ export async function watchSubagentRun(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
-    running.lifecycle = markFailed(
-      running.lifecycle,
-      signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
-      Date.now(),
-      1,
-    );
+    const failure = signal.aborted ? "Subagent cancelled." : err?.message ?? String(err);
+    running.lifecycle = markFailed(running.lifecycle, failure, Date.now(), 1);
+    if (signal.aborted) {
+      publishChildLifecycle(running, {
+        kind: "child_cancelled",
+        severity: "warning",
+        summary: `Sub-agent "${name}" cancelled`,
+      });
+    } else {
+      publishChildLifecycle(running, {
+        kind: "child_failed",
+        severity: "warning",
+        summary: `Sub-agent "${name}" failed: ${failure}`,
+      });
+    }
     updateWidget();
 
     if (signal.aborted) {

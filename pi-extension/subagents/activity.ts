@@ -101,6 +101,142 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
 
+// ── Live Activity events ──
+
+/**
+ * Channel of the Activity extension's event contract. The name is repeated here
+ * instead of imported: the subagents extension must work unchanged when Activity
+ * is not installed, so the envelope is built locally and published best-effort.
+ */
+export const ACTIVITY_EVENT_CHANNEL = "pi-activity:event";
+
+/** Envelope summary cap enforced by the Activity consumer's validator. */
+const ACTIVITY_SUMMARY_LIMIT = 200;
+/** Details byte cap enforced by the Activity consumer's validator (8 KiB). */
+const ACTIVITY_DETAILS_LIMIT_BYTES = 8 * 1024;
+const ACTIVITY_TRUNCATION_MARKER = "… [truncated]";
+
+// ANSI escape sequences (CSI, OSC, DCS and the two/three byte escapes) plus C0/C1
+// controls, keeping newline and tab. Mirrors the Activity consumer's cleaner so a
+// provider excerpt reaches the feed with its shape intact.
+// eslint-disable-next-line no-control-regex
+const ACTIVITY_ANSI_ESCAPE = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+// eslint-disable-next-line no-control-regex
+const ACTIVITY_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
+
+/**
+ * Credential-shaped text is masked before an event leaves the process: the
+ * Activity consumer bounds size, not secrets, and a provider error can quote
+ * response material, so a token that reaches the feed has already leaked.
+ */
+const ACTIVITY_CREDENTIAL_PATTERNS: Array<[RegExp, string]> = [
+  [/\bsk-[A-Za-z0-9_-]{8,}/g, "[redacted]"],
+  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}/g, "[redacted]"],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted]"],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "[redacted]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, "[redacted]"],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]"],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]"],
+  [/\b((?:api[_-]?key|apikey|secret|token|password|passwd|authorization|credential)s?\b\s*[:=]\s*)[^\s,;]*/gi, "$1[redacted]"],
+  // Long opaque runs: base64/hex/url-safe blobs, without path separators.
+  [/\b[A-Za-z0-9+_-]{32,}={0,2}\b/g, "[redacted]"],
+];
+
+const ACTIVITY_ENCODER = new TextEncoder();
+const ACTIVITY_DECODER = new TextDecoder();
+const ACTIVITY_MARKER_BYTES = ACTIVITY_ENCODER.encode(ACTIVITY_TRUNCATION_MARKER).length;
+
+/** Strip terminal control sequences, then mask credential-shaped runs. */
+function redactActivityText(text: string): string {
+  let redacted = text.replace(ACTIVITY_ANSI_ESCAPE, "").replace(ACTIVITY_CONTROL_CHARS, "");
+  for (const [pattern, replacement] of ACTIVITY_CREDENTIAL_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+function boundActivitySummary(summary: string): string {
+  return redactActivityText(summary).slice(0, ACTIVITY_SUMMARY_LIMIT);
+}
+
+/** Redact details, then cap them where the consumer would truncate anyway. */
+function boundActivityDetails(details: string): string {
+  const redacted = redactActivityText(details);
+  const encoded = ACTIVITY_ENCODER.encode(redacted);
+  if (encoded.length <= ACTIVITY_DETAILS_LIMIT_BYTES) return redacted;
+  // Reserve three bytes beyond the marker so decoding a split multi-byte
+  // character cannot push the result back over the consumer's cap.
+  const kept = encoded.subarray(0, ACTIVITY_DETAILS_LIMIT_BYTES - ACTIVITY_MARKER_BYTES - 3);
+  return ACTIVITY_DECODER.decode(kept) + ACTIVITY_TRUNCATION_MARKER;
+}
+
+export interface ActivityPublisherEvent {
+  /** Emitting Pi session id, '' when unknown. */
+  session: string;
+  actor: { kind: "main" | "child"; name: string; id?: string; parent?: string };
+  source: "skills" | "subagents" | "hooks";
+  kind: string;
+  severity: "info" | "warning" | "error";
+  summary: string;
+  details?: string;
+  correlation?: { skill?: string; path?: string; extension?: string; hook?: string; durationMs?: number };
+}
+
+/** The part of Pi's extension API this publisher needs. */
+export interface ActivityEventSink {
+  events?: { emit(channel: string, data: unknown): void } | null;
+}
+
+let activitySequence = 0;
+
+function activityGeneration(): number {
+  const parsed = Number.parseInt(process.env.PI_ACTIVITY_GENERATION ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
+ * Publish one event on the in-process Activity channel. Never throws and stays a
+ * silent no-op without a consumer: reporting must not break a launch, a skill
+ * load or a completion delivery. Returns whether the consumer claimed it.
+ */
+export function publishActivityEvent(
+  sink: ActivityEventSink | undefined,
+  event: ActivityPublisherEvent,
+): boolean {
+  const seq = ++activitySequence;
+  const summary = boundActivitySummary(event.summary);
+  const details = event.details ? boundActivityDetails(event.details) : undefined;
+  const envelope: Record<string, unknown> = {
+    v: 1,
+    // Producer-namespaced: every publisher starts its own sequence at 1, and the
+    // consumer dedupes on actor/session + id, so a bare session:seq would let one
+    // extension's event drop another's.
+    id: `herdr:${event.session}:${seq}`,
+    seq,
+    at: Date.now(),
+    root: process.env.PI_ACTIVITY_ROOT ?? "",
+    session: event.session,
+    generation: activityGeneration(),
+    actor: event.actor,
+    source: event.source,
+    kind: event.kind,
+    severity: event.severity,
+    presentation: "routine",
+    summary,
+    ...(details ? { details } : {}),
+    ...(event.correlation ? { correlation: event.correlation } : {}),
+    claimed: false,
+  };
+
+  try {
+    sink?.events?.emit(ACTIVITY_EVENT_CHANNEL, envelope);
+  } catch {
+    // A throwing consumer must not break the caller's real work.
+    return false;
+  }
+  return envelope.claimed === true;
+}
+
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
 }

@@ -9,7 +9,8 @@ import { dirname } from "node:path";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { readFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, publishActivityEvent } from "./activity.ts";
+import { observingHooks } from "./hooks.ts";
 import { writeCompletionSidecar, type CompletionSidecar } from "./handoff.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -83,15 +84,96 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export function loadAssignedSkills(selection: string, commands: SlashCommandInfo[]): string {
+export interface AssignedSkillAttempt {
+  name: string;
+  loaded: boolean;
+  /** Resolved skill file; absent when the skill is not available in this catalog. */
+  path?: string;
+  /** Why this skill is not loaded, when it is not. */
+  error?: string;
+}
+
+/**
+ * Read the assigned skills into one instruction block. A missing or unreadable
+ * skill fails the whole load, so an attempt is reported as loaded only when its
+ * own read succeeded and the load completed — a partial read loads nothing.
+ * `onAttempt` observes every attempt, loaded or not.
+ */
+export function loadAssignedSkills(
+  selection: string,
+  commands: SlashCommandInfo[],
+  onAttempt?: (attempt: AssignedSkillAttempt) => void,
+): string {
   if (!selection.trim() || selection.trim() === "none") return "";
   if (selection.trim() === "all") throw new Error("Assign specific skill names; skills: all is not supported.");
-  return [...new Set(selection.split(",").map((name) => name.trim()).filter(Boolean))].map((name) => {
-    const skill = commands.find((command) => command.source === "skill" && command.name === `skill:${name}`);
-    if (!skill) throw new Error(`Assigned skill not available: ${name}`);
-    const path = skill.sourceInfo.path;
-    return `<skill name="${name}" location="${path}">\nReferences are relative to ${dirname(path)}.\n\n${stripFrontmatter(readFileSync(path, "utf8")).trim()}\n</skill>`;
-  }).join("\n\n");
+
+  const attempts: AssignedSkillAttempt[] = [...new Set(selection.split(",").map((name) => name.trim()).filter(Boolean))]
+    .map((name) => {
+      const skill = commands.find((command) => command.source === "skill" && command.name === `skill:${name}`);
+      return skill
+        ? { name, path: skill.sourceInfo.path, loaded: false }
+        : { name, loaded: false, error: `Assigned skill not available: ${name}` };
+    });
+
+  try {
+    const unavailable = attempts.find((attempt) => attempt.error);
+    if (unavailable) throw new Error(unavailable.error);
+
+    return attempts.map((attempt) => {
+      const path = attempt.path!;
+      const block = `<skill name="${attempt.name}" location="${path}">\nReferences are relative to ${dirname(path)}.\n\n${stripFrontmatter(readFileSync(path, "utf8")).trim()}\n</skill>`;
+      attempt.loaded = true;
+      return block;
+    }).join("\n\n");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const attempt of attempts) {
+      attempt.loaded = false;
+      attempt.error ??= message;
+    }
+    throw error;
+  } finally {
+    for (const attempt of attempts) onAttempt?.(attempt);
+  }
+}
+
+/** The child's own session id for event attribution; '' when the host has none. */
+function childSessionId(ctx: { sessionManager?: { getSessionId?(): string } }): string {
+  try {
+    return ctx.sessionManager?.getSessionId?.() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Report one assigned-skill load attempt, in the child process, on the ordinary
+ * pi.events channel. A silent no-op without the Activity reporter: loading
+ * skills must not fail because nobody is collecting.
+ */
+function publishSkillAttempt(pi: ExtensionAPI, attempt: AssignedSkillAttempt, sessionId: string): void {
+  const childId = process.env.PI_SUBAGENT_ID;
+  const details = [
+    attempt.path ? `path: ${attempt.path}` : "",
+    attempt.error ? `error: ${attempt.error}` : "",
+  ].filter(Boolean).join("\n");
+
+  publishActivityEvent(pi, {
+    session: sessionId,
+    actor: {
+      kind: "child",
+      name: process.env.PI_SUBAGENT_NAME || "subagent",
+      ...(childId ? { id: childId } : {}),
+    },
+    source: "skills",
+    kind: "skill_assigned",
+    severity: attempt.loaded ? "info" : "warning",
+    summary: attempt.loaded
+      ? `Assigned skill "${attempt.name}" loaded`
+      : `Assigned skill "${attempt.name}" not loaded`,
+    ...(details ? { details } : {}),
+    correlation: { skill: attempt.name, ...(attempt.path ? { path: attempt.path } : {}) },
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -176,8 +258,10 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
 
+  const hooks = observingHooks(pi);
+
   // Show widget + status bar on session start
-  pi.on("session_start", (_event, ctx) => {
+  hooks.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
     notify = (message, type) => ctx.ui.notify(message, type);
     const tools = pi.getAllTools();
@@ -187,12 +271,14 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", (event, ctx) => {
+  hooks.on("input", (event, ctx) => {
     recorder.input();
     if (shouldMarkUserTookOver(agentStarted)) userTookOver = true;
     if (!assignedSkills || assignedSkills.trim() === "none") return;
     try {
-      const instructions = loadAssignedSkills(assignedSkills, pi.getCommands());
+      const instructions = loadAssignedSkills(assignedSkills, pi.getCommands(), (attempt) =>
+        publishSkillAttempt(pi, attempt, childSessionId(ctx)),
+      );
       return { action: "transform", text: `${instructions}\n\n${event.text}`, images: event.images };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -204,16 +290,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", () => {
+  hooks.on("before_agent_start", () => {
     recorder.beforeAgentStart();
   });
 
-  pi.on("agent_start", () => {
+  hooks.on("agent_start", () => {
     agentStarted = true;
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event) => {
+  hooks.on("agent_end", (event) => {
     // agent_end is not terminal: Pi may compact and automatically retry after
     // this event. Keep the latest result, but do not publish completion or
     // shut down until agent_settled confirms no continuation will run.
@@ -221,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     recorder.agentEndWaiting();
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  hooks.on("agent_settled", (_event, ctx) => {
     const shouldExit = autoExit
       && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
 
@@ -251,50 +337,50 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("turn_start", (event) => {
+  hooks.on("turn_start", (event) => {
     recorder.turnStart((event as any).turnIndex);
   });
 
-  pi.on("turn_end", (event) => {
+  hooks.on("turn_end", (event) => {
     recorder.turnEnd((event as any).turnIndex);
   });
 
-  pi.on("before_provider_request", () => {
+  hooks.on("before_provider_request", () => {
     recorder.beforeProviderRequest();
   });
 
-  pi.on("after_provider_response", () => {
+  hooks.on("after_provider_response", () => {
     recorder.afterProviderResponse();
   });
 
-  pi.on("message_update", (event) => {
+  hooks.on("message_update", (event) => {
     recorder.messageUpdate((event as any).assistantMessageEvent?.type);
   });
 
-  pi.on("tool_execution_start", (event) => {
+  hooks.on("tool_execution_start", (event) => {
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("tool_call", (event) => {
+  hooks.on("tool_call", (event) => {
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
     if (parseDeniedTools(deniedToolsValue).includes(event.toolName)) {
       return { block: true, reason: `Tool denied by this agent definition: ${event.toolName}` };
     }
   });
 
-  pi.on("tool_execution_update", (event) => {
+  hooks.on("tool_execution_update", (event) => {
     recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("tool_result", (event) => {
+  hooks.on("tool_result", (event) => {
     recorder.toolResult((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("tool_execution_end", (event) => {
+  hooks.on("tool_execution_end", (event) => {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("session_shutdown", (event) => {
+  hooks.on("session_shutdown", (event) => {
     recorder.sessionShutdown((event as any).reason);
   });
 

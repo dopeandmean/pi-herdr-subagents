@@ -28,6 +28,56 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
   return [...allow].join(",");
 }
 
+/**
+ * Transient Activity transport values. The main Pi process publishes them in its
+ * own environment; Herdr copies them into every spawned and resumed child, and
+ * they are never written to a launch profile — a saved endpoint names a
+ * collector that only the process that created it can still reach.
+ */
+export const ACTIVITY_ENV_KEYS = [
+  "PI_ACTIVITY_ENDPOINT",
+  "PI_ACTIVITY_ROOT",
+  "PI_ACTIVITY_GENERATION",
+  "PI_ACTIVITY_REPORTER",
+] as const;
+
+/** The Activity values this process can hand to a child; absent means absent. */
+export function readActivityEnv(
+  source: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const key of ACTIVITY_ENV_KEYS) {
+    const value = source[key];
+    if (typeof value === "string" && value.length > 0) values[key] = value;
+  }
+  return values;
+}
+
+/**
+ * `-e <reporter>` for the Activity reporter, at most once: a profile that already
+ * carries the same path needs no second copy. The child's role-specific agent
+ * directory may omit user extensions, so the reporter is loaded explicitly.
+ */
+export function activityReporterArgs(
+  args: readonly string[],
+  reporterPath: string | undefined,
+): string[] {
+  return reporterPath && !args.includes(reporterPath) ? ["-e", reporterPath] : [];
+}
+
+/**
+ * Activity argv/environment for a resumed child, taken from the current parent
+ * process rather than the saved profile, which may name an endpoint from a
+ * earlier Pi process.
+ */
+export function resumeActivityLaunch(
+  profileArgs: readonly string[],
+  parentEnv: Record<string, string | undefined> = process.env,
+): { args: string[]; env: Record<string, string> } {
+  const env = readActivityEnv(parentEnv);
+  return { args: activityReporterArgs(profileArgs, env.PI_ACTIVITY_REPORTER), env };
+}
+
 /** Reusable Pi settings, excluding a run's task and lifecycle identity. */
 export interface PiLaunchProfile {
   args: string[];
@@ -75,6 +125,8 @@ export function readPiLaunchProfile(sessionFile: string): PiLaunchProfile | null
   if (profile.lane !== undefined && !isValidLaneReference(profile.lane)) {
     throw new Error(`Invalid Pi launch profile: ${path} (lane reference)`);
   }
+  // Transient Activity values are refreshed from the live parent on resume.
+  for (const key of ACTIVITY_ENV_KEYS) delete profile.env[key];
   return profile;
 }
 
@@ -189,6 +241,12 @@ export class PiHarnessDriver implements HarnessDriver {
     };
     mkdirSync(dirname(subagentSessionFile), { recursive: true });
     writeFileSync(`${subagentSessionFile}.launch.json`, JSON.stringify(profile), "utf8");
+
+    // The Activity transport is transient: it is written into the child command
+    // only now, so the durable profile stays free of collector endpoints.
+    const activityEnv = readActivityEnv();
+    parts.push(...activityReporterArgs(parts, activityEnv.PI_ACTIVITY_REPORTER));
+    Object.assign(env, activityEnv);
 
     env.PI_SUBAGENT_NAME = params.name;
     env.PI_SUBAGENT_AUTO_EXIT = effectiveAutoExit ? "1" : "0";

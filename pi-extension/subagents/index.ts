@@ -11,6 +11,7 @@ import {
   resolveAgentDefinition,
 } from "./discovery.ts";
 import { buildSubagentRoutingGuidelines, setRoutingGuidelines } from "./guidelines.ts";
+import { observingHooks } from "./hooks.ts";
 import { loadModelConfig } from "./model-config.ts";
 import {
   cleanupSubagentsForShutdown,
@@ -33,9 +34,11 @@ const modelConfig = loadModelConfig();
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
 
+  const hooks = observingHooks(pi);
+
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
-  pi.on("session_start", (_event, ctx) => {
+  hooks.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     runtime.agentCatalog = buildAvailableAgentCatalog(
@@ -52,7 +55,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (event, _ctx) => {
+  hooks.on("session_shutdown", (event, _ctx) => {
     stopTracking();
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
   });
